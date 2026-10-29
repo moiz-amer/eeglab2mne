@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "eeglab2mne"
+version = "0.1.0"
+description = "Translate EEGLAB pipelines into auditable MNE-Python code"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Moiz Amer" }]
+keywords = ["EEG", "EEGLAB", "MNE", "neuroscience", "reproducibility", "MATLAB"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+# The translator itself is pure Python. MNE is only needed to *run* the output.
+dependencies = []
+
+[project.optional-dependencies]
+run = ["mne>=1.6", "pymatreader", "mne-icalabel", "onnxruntime"]
+test = ["pytest", "mne>=1.6", "pymatreader", "eeglabio", "mne-icalabel", "onnxruntime", "scipy"]
+
+[project.scripts]
+eeglab2mne = "eeglab2mne.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/YOUR-USERNAME/eeglab2mne"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/eeglab2mne"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+filterwarnings = ["ignore::DeprecationWarning", "ignore::RuntimeWarning"]

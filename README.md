@@ -1,4 +1,5 @@
 # eeglab2mne
+[![tests](https://github.com/moiz-amer/eeglab2mne/actions/workflows/tests.yml/badge.svg)](https://github.com/moiz-amer/eeglab2mne/actions/workflows/tests.yml)
 
 **Translate EEGLAB pipelines into MNE-Python, and know exactly which steps you can trust.**
 

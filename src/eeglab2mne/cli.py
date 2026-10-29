@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .core import history_from_set, translate
+from .core import inspect_set, translate
 from .translators import Status
 
 
@@ -38,14 +38,21 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     path = Path(args.input)
+    set_info = None
     if path.suffix.lower() == ".set":
-        text = history_from_set(path)
+        set_info = inspect_set(path)
+        text = set_info["history"]
+        if not text.strip() and not set_info["has_ica"]:
+            print(f"eeglab2mne: {path.name} has an empty EEG.history; nothing to translate.",
+                  file=sys.stderr)
+            return 1
     else:
         text = path.read_text(encoding="utf-8", errors="replace")
 
     # A processed .set holds its own ICA, so that is where reuse mode reads it.
-    ica_source = str(path) if path.suffix.lower() == ".set" else None
-    result = translate(text, ica_mode=args.ica, source_name=path.name, ica_source=ica_source)
+    ica_source = str(path) if set_info else None
+    result = translate(text, ica_mode=args.ica, source_name=path.name, ica_source=ica_source,
+                       set_info=set_info)
 
     code = result.to_python()
     if args.output:

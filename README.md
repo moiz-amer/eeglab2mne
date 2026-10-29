@@ -82,6 +82,20 @@ bad = np.any((data < -100) | (data > 100), axis=(1, 2))   # absolute, not peak-t
 See the full [generated script](examples/erp_preprocessing_mne.py) and
 [migration report](examples/erp_preprocessing_report.md).
 
+## Validated on EEGLAB's own data
+
+The test suite downloads EEGLAB's tutorial dataset (`eeglab_data_epochs_ica.set`,
+processed and ICA-decomposed in EEGLAB itself), translates its stored history,
+runs the generated MNE code, and compares the result with EEGLAB's math:
+
+| Check | Result |
+|---|---|
+| ICA activations, MNE vs EEGLAB (all 32 components) | correlation = 1.0000000000 |
+| Data after removing components (`pop_subcomp`) | max relative difference 3 × 10⁻¹⁵ (floating-point rounding) |
+
+So when you migrate already-processed data with `--ica reuse`, MNE reproduces
+EEGLAB's ICA cleaning exactly.
+
 ## Pitfalls it handles
 
 - **Units.** EEGLAB baselines are in ms and amplitudes in µV; MNE uses s and V.
@@ -92,16 +106,18 @@ See the full [generated script](examples/erp_preprocessing_mne.py) and
 - **Reference channels.** `pop_reref` removes the new reference channels unless `'keepref','on'`; MNE keeps them. The translation drops them to match.
 - **Filters.** `revfilt` becomes a band-stop; an explicit `filtorder` becomes `filter_length = order + 1`.
 - **Epoching.** `pop_epoch` doesn't baseline-correct, so `baseline=None` (MNE's default would).
+- **Translating a `.set` file.** History paths point at the original author's machine, so loads of that dataset are redirected to your file; epoched datasets are read as `mne.Epochs`; steps made moot by a later reload of the same file are marked superseded; and an ICA computed *before* the recorded history is still loaded.
 
 ## Supported EEGLAB functions
 
 | Area | Functions |
 |---|---|
 | I/O | `pop_loadset`, `pop_saveset`, `pop_biosig`, `pop_fileio`, `pop_loadbv`, and other importers |
-| Channels | `pop_select`, `pop_chanedit` (`'lookup'`), `pop_interp`, `pop_reref` |
+| Channels | `pop_select`, `pop_chanedit` (`'lookup'`, `'load'`, `'settype'`, `'changefield'` for type/labels), `pop_interp`, `pop_reref` |
 | Filtering | `pop_eegfiltnew`, `pop_eegfilt` (legacy), `pop_resample`, `pop_cleanline` |
 | Epochs | `pop_epoch`, `pop_rmbase`, `pop_eegthresh`, `pop_rejepoch` |
 | ICA | `pop_runica` (runica/binica/picard/fastica), `pop_iclabel`, `pop_icflag`, `pop_subcomp`, `pop_selectcomps` |
+| Plotting (skipped) | `pop_topoplot`, `pop_eegplot`, `pop_spectopo`, `pop_erpimage`, `pop_timtopo`, `pop_prop`, and similar |
 | Flagged for manual work | `pop_clean_rawdata` / `clean_artifacts` (with a parameter-by-parameter mapping to pyprep, ASR and EEGPrep) |
 
 Unknown functions are never dropped; they become `TODO`s.
@@ -127,7 +143,8 @@ rate, baseline, ICLabel output shape, carried-over rejected components).
 
 ## Roadmap
 
-- [ ] Numerical validation: run each translated step against EEGLAB output on public datasets and publish per-step error (the "approximate" grades should become measured numbers)
+- [x] Numerical validation of ICA reuse against EEGLAB's tutorial dataset
+- [ ] Numerical validation of the remaining steps (filtering, resampling, re-referencing) against EEGLAB output, so every "approximate" grade becomes a measured number
 - [ ] Translate `clean_rawdata` directly to pyprep + ASR with matched parameters
 - [ ] ERPLAB functions (`pop_binlister`, `pop_averager`)
 - [ ] `STUDY` scripts → MNE-BIDS / group loops

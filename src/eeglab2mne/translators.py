@@ -9,6 +9,7 @@ numerically identical, which are close, and which need a human.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
@@ -49,6 +50,9 @@ class Context:
     warnings: list[str] = field(default_factory=list)
     input_path: str | None = None
     ica_source: str | None = None  # .set file holding EEGLAB's ICA (reuse mode)
+    # Facts read from the .set file being translated (when translating a .set):
+    # {"path": str, "epoched": bool, "has_ica": bool}
+    set_info: dict | None = None
 
 
 class NeedsManual(Exception):
@@ -154,6 +158,20 @@ def _eegplot(call: Call, ctx: Context) -> Step:
                  ["Plotting only. Marking bad segments in the MNE browser creates BAD_ annotations."])
 
 
+_PLOTTING = (
+    "pop_topoplot", "topoplot", "pop_plottopo", "plottopo", "pop_erpimage", "erpimage",
+    "pop_timtopo", "timtopo", "pop_envtopo", "envtopo", "pop_prop", "pop_prop_extended",
+    "pop_headplot", "headplot", "pop_comperp", "pop_plotdata", "pop_eegplot_w",
+)
+
+
+@translates(*_PLOTTING)
+def _plotting(call: Call, ctx: Context) -> Step:
+    return _step(call, Status.SKIPPED,
+                 notes=["Plotting only; does not change the data. MNE equivalents: "
+                        "evoked.plot_topomap(), epochs.plot_image(), ica.plot_properties()."])
+
+
 @translates("pop_spectopo", "spectopo")
 def _spectopo(call: Call, ctx: Context) -> Step:
     return _step(call, Status.SKIPPED, [f"# {ctx.obj}.compute_psd().plot()  # optional"],
@@ -169,17 +187,36 @@ def _loadset(call: Call, ctx: Context) -> Step:
     fpath = call.get("filepath", call.positional[1] if len(call.positional) > 1 else "")
     if fname is None:
         raise NeedsManual("no filename given")
+    notes: list[str] = []
+    info = ctx.set_info
+    epoched = None
     if isinstance(fname, Expr) or isinstance(fpath, Expr):
         fname_code = "INPUT_SET  # TODO: set path (was a MATLAB variable)"
+    elif info and str(fname).replace("\\", "/").split("/")[-1] == Path(info["path"]).name:
+        # The history records paths on the machine that made it; point at the real file.
+        fname_code = lit(info["path"])
+        ctx.input_path = info["path"]
+        epoched = info["epoched"]
+        if fpath:
+            notes.append(f"Original path `{fpath}` is from the machine that created the file; "
+                         "replaced with the file you translated.")
     else:
         full = (fpath.rstrip("/\\") + "/" + fname) if fpath else fname
         fname_code = lit(full)
         ctx.input_path = full
-    ctx.obj = "raw"
-    return _step(call, Status.EXACT, [f"raw = mne.io.read_raw_eeglab({fname_code}, preload=True)"],
-                 ["If this .set is already epoched, use mne.read_epochs_eeglab() instead and "
-                  "rename `raw` to `epochs`.",
-                  "Channel types: EEGLAB marks everything as EEG; set EOG/ECG with raw.set_channel_types()."])
+
+    if epoched:
+        ctx.obj = "epochs"
+        code = [f"epochs = mne.read_epochs_eeglab({fname_code})"]
+        notes.append("Dataset is epoched (EEG.trials > 1), so it is read as mne.Epochs.")
+    else:
+        ctx.obj = "raw"
+        code = [f"raw = mne.io.read_raw_eeglab({fname_code}, preload=True)"]
+        if epoched is None:
+            notes.append("If this .set is already epoched, use mne.read_epochs_eeglab() instead "
+                         "and rename `raw` to `epochs`.")
+    notes.append("Channel types: EEGLAB marks everything as EEG; set EOG/ECG with set_channel_types().")
+    return _step(call, Status.EXACT, code, notes)
 
 
 @translates("pop_biosig", "pop_fileio", "pop_loadbv", "pop_readegi", "pop_loadcnt", "pop_loadeep")
@@ -213,18 +250,82 @@ def _saveset(call: Call, ctx: Context) -> Step:
 # ---- channels -------------------------------------------------------------
 
 
+_MNE_TYPES = {"eeg": "eeg", "eog": "eog", "heog": "eog", "veog": "eog", "ecg": "ecg",
+              "ekg": "ecg", "emg": "emg", "misc": "misc", "ref": "misc", "stim": "stim"}
+_RANK = {Status.SKIPPED: 0, Status.EXACT: 1, Status.APPROX: 2, Status.MANUAL: 3}
+
+
+def _ch_index_expr(ctx: Context, spec: Any) -> str:
+    """EEGLAB channel spec (1-based number, list, or '1:32' string) -> names expr."""
+    from .parser import parse_value
+
+    if isinstance(spec, str):
+        spec = parse_value(spec)
+    return ch_names_expr(ctx, spec)
+
+
 @translates("pop_chanedit")
 def _chanedit(call: Call, ctx: Context) -> Step:
-    if call.has("lookup") and len(call.kwargs) == 1:
-        return _step(call, Status.APPROX,
-                     ["# MNE 1.13 renamed 'standard_1005' to 'colin27_1005'; pick whichever exists",
-                      "_template = next(m for m in ('colin27_1005', 'standard_1005')",
-                      "                 if m in mne.channels.get_builtin_montages())",
-                      f"{ctx.obj}.set_montage(_template, on_missing='warn')"],
-                     ["EEGLAB 'lookup' matches labels against a template file (often "
-                      "standard_1005.elc). MNE's built-in standard_1005 positions are close but "
-                      "come from a different template, so coordinates (and topoplots) can differ slightly."])
-    raise NeedsManual("pop_chanedit with edits other than 'lookup' (e.g. changefield, load, convert)")
+    o = ctx.obj
+    code: list[str] = []
+    notes: list[str] = []
+    status = Status.SKIPPED
+    for key, val in call.pairs:
+        st = Status.EXACT
+        if key == "lookup":
+            st = Status.APPROX
+            code += ["# MNE 1.13 renamed 'standard_1005' to 'colin27_1005'; pick whichever exists",
+                     "_template = next(m for m in ('colin27_1005', 'standard_1005')",
+                     "                 if m in mne.channels.get_builtin_montages())",
+                     f"{o}.set_montage(_template, on_missing='warn')"]
+            notes.append("'lookup' matches labels against a template file (here "
+                         f"`{str(val).split('/')[-1]}`). MNE's built-in 10-05 template is close but "
+                         "not identical, so coordinates and topoplots can differ slightly.")
+        elif key == "load":
+            path = val[0] if isinstance(val, list) and val else val
+            if not isinstance(path, str):
+                raise NeedsManual("pop_chanedit 'load' with a non-literal file")
+            st = Status.APPROX
+            code.append(f"{o}.set_montage(mne.channels.read_custom_montage({path!r}), on_missing='warn')")
+            notes.append(f"Loads electrode positions from `{path.split('/')[-1]}`; update the path "
+                         "if the file lives elsewhere on your machine.")
+        elif key == "settype":
+            if not (isinstance(val, list) and len(val) == 2):
+                raise NeedsManual("unexpected 'settype' value")
+            chans, typ = val
+            mne_type = _MNE_TYPES.get(str(typ).lower())
+            if mne_type is None:
+                raise NeedsManual(f"channel type '{typ}'")
+            code.append(f"{o}.set_channel_types({{ch: {mne_type!r} for ch in {_ch_index_expr(ctx, chans)}}})")
+        elif key == "changefield":
+            if not (isinstance(val, list) and len(val) == 3):
+                raise NeedsManual("unexpected 'changefield' value")
+            idx, fieldname, new = val
+            if not isinstance(idx, int):
+                raise NeedsManual("'changefield' channel index is not a number")
+            ch = f"{o}.ch_names[{idx - 1}]"
+            if str(fieldname).lower() == "type":
+                mne_type = _MNE_TYPES.get(str(new).lower())
+                if mne_type is None:
+                    raise NeedsManual(f"channel type '{new}'")
+                code.append(f"{o}.set_channel_types({{{ch}: {mne_type!r}}})  # EEGLAB channel {idx}")
+            elif str(fieldname).lower() == "labels":
+                code.append(f"{o}.rename_channels({{{ch}: {new!r}}})  # EEGLAB channel {idx}")
+            else:
+                raise NeedsManual(f"'changefield' of '{fieldname}'")
+        elif key in ("plotrad", "shrink", "nosedir"):
+            st = Status.SKIPPED
+            notes.append(f"'{key}' only changes how scalp maps are drawn.")
+        elif key == "eval" and "writelocs" in str(val):
+            st = Status.SKIPPED
+            notes.append("'eval' here only exports channel locations to a file.")
+        else:
+            raise NeedsManual(f"pop_chanedit option '{key}'")
+        if _RANK[st] > _RANK[status]:
+            status = st
+    if not call.pairs:
+        raise NeedsManual("pop_chanedit with no options (interactive GUI)")
+    return _step(call, status, code, notes)
 
 
 @translates("pop_select")
@@ -498,25 +599,32 @@ def _rmbase(call: Call, ctx: Context) -> Step:
 _ICA_METHODS = {"runica": "infomax", "binica": "infomax", "picard": "picard", "fastica": "fastica"}
 
 
+ICA_REUSE_NOTE = ("Reuses EEGLAB's own unmixing matrix, so components (and their indices) "
+                  "match exactly. Use this when migrating already-processed data.")
+
+
+def ica_reuse_code(ctx: Context) -> list[str]:
+    """Code that loads EEGLAB's ICA, including the components it flagged."""
+    ctx.has_ica = True
+    ctx.imports.add("from pymatreader import read_mat")
+    ctx.imports.add("import numpy as np")
+    src_path = ctx.ica_source or ctx.input_path
+    src = lit(src_path) if src_path else "ICA_SET  # TODO: .set file holding the ICA"
+    return [f"ica_set = {src}",
+            "ica = mne.preprocessing.read_ica_eeglab(ica_set)",
+            "# read_ica_eeglab does not carry over components flagged for rejection,",
+            "# so recover EEG.reject.gcompreject ourselves:",
+            "_mat = read_mat(ica_set)",
+            "_mat = _mat.get('EEG', _mat)",
+            "_flags = np.atleast_1d(_mat.get('reject', {}).get('gcompreject', []))",
+            "ica.exclude = [int(i) for i in np.flatnonzero(_flags)]"]
+
+
 @translates("pop_runica", "runica")
 def _runica(call: Call, ctx: Context) -> Step:
     ctx.has_ica = True
     if ctx.ica_mode == "reuse":
-        ctx.imports.add("from pymatreader import read_mat")
-        ctx.imports.add("import numpy as np")
-        src_path = ctx.ica_source or ctx.input_path
-        src = lit(src_path) if src_path else "ICA_SET  # TODO: .set file holding the ICA"
-        return _step(call, Status.EXACT,
-                     [f"ica_set = {src}",
-                      "ica = mne.preprocessing.read_ica_eeglab(ica_set)",
-                      "# read_ica_eeglab does not carry over components flagged for rejection,",
-                      "# so recover EEG.reject.gcompreject ourselves:",
-                      "_mat = read_mat(ica_set)",
-                      "_mat = _mat.get('EEG', _mat)",
-                      "_flags = np.atleast_1d(_mat.get('reject', {}).get('gcompreject', []))",
-                      "ica.exclude = [int(i) for i in np.flatnonzero(_flags)]"],
-                     ["Reuses EEGLAB's own unmixing matrix, so components (and their indices) match "
-                      "exactly. Use this when migrating already-processed data."])
+        return _step(call, Status.EXACT, ica_reuse_code(ctx), [ICA_REUSE_NOTE])
 
     icatype = str(call.get("icatype", "runica")).lower()
     method = _ICA_METHODS.get(icatype)

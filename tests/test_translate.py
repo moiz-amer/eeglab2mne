@@ -102,3 +102,42 @@ def test_example_script_generates_valid_python(mode):
     ast.parse(t.to_python())
     report = t.to_report()
     assert "## Summary" in report and "pop_clean_rawdata" in report
+
+
+def test_plotting_is_skipped_not_manual():
+    t = translate("figure; pop_topoplot(EEG, 0, 1, 'x', [1 1], 0, 'electrodes', 'on');")
+    assert all(s.status is Status.SKIPPED for s in t.steps)
+
+
+def test_chanedit_types_and_fields_in_order():
+    src = ("EEG = pop_chanedit(EEG, 'settype', {'1:32', 'EEG'}, "
+           "'changefield', {2, 'type', 'EOG'}, 'changefield', {6, 'type', 'EOG'}, "
+           "'changefield', {1, 'labels', 'Fp1'});")
+    s, _ = one(src)
+    assert s.status is Status.EXACT
+    assert "raw.ch_names[0:32]" in s.code[0]
+    assert "raw.ch_names[1]: 'eog'" in s.code[1]   # both changefields kept, in order
+    assert "raw.ch_names[5]: 'eog'" in s.code[2]
+    assert "rename_channels({raw.ch_names[0]: 'Fp1'})" in s.code[3]
+
+
+def test_chanedit_display_only_is_skipped():
+    t = translate("EEG.chanlocs = pop_chanedit(EEG.chanlocs, 'plotrad', 0.5);")
+    assert t.steps[0].status is Status.SKIPPED
+
+
+def test_set_info_reads_epochs_and_loads_prior_ica():
+    info = {"path": "/my/data/sub01.set", "epoched": True, "has_ica": True}
+    hist = ("EEG = pop_chanedit(EEG, 'load', {'/other/machine/locs.ced'});\n"
+            "EEG = pop_loadset('filename', 'sub01.set', 'filepath', '/other/machine/');")
+    t = translate(hist, ica_mode="reuse", ica_source=info["path"], set_info=info)
+    assert t.steps[0].status is Status.SKIPPED            # superseded by the reload
+    assert "mne.read_epochs_eeglab('/my/data/sub01.set')" in t.steps[1].code[0]
+    assert t.steps[-1].source.startswith("(ICA")           # ICA appended
+    assert t.steps[-1].status is Status.EXACT
+
+
+def test_prior_ica_warns_in_refit_mode():
+    info = {"path": "x.set", "epoched": False, "has_ica": True}
+    t = translate("EEG = eeg_checkset(EEG);", set_info=info)
+    assert any("--ica reuse" in w for w in t.ctx.warnings)

@@ -44,6 +44,9 @@ class Call:
     line: int
     kwargs: dict[str, Any] = field(default_factory=dict)
     positional: list[Any] = field(default_factory=list)
+    # Ordered ('key', value) pairs. Unlike ``kwargs`` this keeps repeated keys,
+    # which some functions rely on (e.g. several 'changefield' edits).
+    pairs: list[tuple[str, Any]] = field(default_factory=list)
 
     def get(self, key: str, default: Any = None) -> Any:
         """Case-insensitive lookup of a ``'key', value`` argument."""
@@ -356,7 +359,8 @@ def _pair_kwargs(call: Call) -> None:
             # is not misread as a key in positional calls.
             if all(re.match(r"^[A-Za-z_]\w*$", tail[i]) for i in range(0, len(tail), 2)) and tail:
                 call.positional = args[:start]
-                call.kwargs = {tail[i].lower(): tail[i + 1] for i in range(0, len(tail), 2)}
+                call.pairs = [(tail[i].lower(), tail[i + 1]) for i in range(0, len(tail), 2)]
+                call.kwargs = dict(call.pairs)
                 return
     call.positional = args
     call.kwargs = {}

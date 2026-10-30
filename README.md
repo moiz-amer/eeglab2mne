@@ -112,6 +112,7 @@ a line-by-line port of EEGLAB's firfilt plugin:
 |---|---|
 | Filter coefficients, MNE vs EEGLAB `firws` (1–30 Hz, 128 Hz) | identical |
 | Filtered data: bandpass, highpass, lowpass, band-stop, fixed order, `boundary` events | max relative difference < 10⁻¹² |
+| **Same script in real EEGLAB (MATLAB) vs translated MNE code**: load → 1–30 Hz filter → average reference → epoch → baseline, 80 epochs | correlation 1.000000, max difference < 0.001 µV (before the fix: 0.998 and 12.8 µV) |
 
 ## Pitfalls it handles
 

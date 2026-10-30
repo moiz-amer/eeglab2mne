@@ -38,7 +38,7 @@ EEG = pop_resample(EEG, 250);
 EEG = pop_eegfiltnew(EEG, 'locutoff', 1, 'hicutoff', 100);
 EEG = pop_cleanline(EEG, 'linefreqs', 50);
 EEG = pop_reref(EEG, []);
-EEG = pop_runica(EEG, 'icatype', 'runica', 'extended', 1, 'pca', 14);
+EEG = pop_runica(EEG, 'icatype', 'runica', 'extended', 1, 'pca', 14, 'maxsteps', 50);
 EEG = pop_iclabel(EEG, 'default');
 EEG = pop_icflag(EEG, [NaN NaN; 0.9 1; 0.9 1; NaN NaN; NaN NaN; NaN NaN; NaN NaN]);
 EEG = pop_subcomp(EEG, [], 0);
@@ -57,6 +57,7 @@ EEG = pop_saveset(EEG, 'filename', 'out.set', 'filepath', './');
     assert epochs.info["sfreq"] == 250
     assert "HEOG" not in epochs.ch_names
     assert ns["ic_proba"].shape == (14, 7)
+    assert ns["ica"].max_iter == 50  # 'maxsteps' carried over
     np.testing.assert_allclose(ns["ic_proba"].sum(axis=1), 1, atol=1e-4)
     # baseline really is zero-mean over -200..0 ms
     base = epochs.copy().crop(-0.2, 0).get_data().mean(axis=-1)

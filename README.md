@@ -45,7 +45,7 @@ From Python:
 from eeglab2mne import translate
 
 t = translate(open("preprocess.m").read())
-print(t.counts)          # Counter({exact: 8, approximate: 7, manual: 2, skipped: 4})
+print(t.counts)          # Counter({exact: 9, approximate: 6, manual: 2, skipped: 4})
 open("pipeline.py", "w").write(t.to_python())
 ```
 
@@ -68,7 +68,10 @@ EEG = pop_eegthresh(EEG, 1, 1:30, -100, 100, -0.2, 0.796, 0, 1);
 Output (excerpt):
 
 ```python
-raw.filter(l_freq=1, h_freq=40, method='fir', fir_design='firwin', fir_window='hamming', phase='zero')
+_df = min(max(1 * 0.25, 2), min(1, _fs / 2 - 40))   # EEGLAB's transition-band rule
+_order = int(np.ceil(3.3 / (_df / _fs) / 2) * 2)
+raw.filter(l_freq=1, h_freq=40, l_trans_bandwidth=_df, h_trans_bandwidth=_df,
+           filter_length=_order + 1, pad='edge', ...)   # identical to EEGLAB's filter
 raw.set_eeg_reference('average', projection=False)
 ica = mne.preprocessing.ICA(n_components=None, method='infomax', fit_params=dict(extended=True), ...)
 ica.fit(raw)
@@ -96,6 +99,20 @@ runs the generated MNE code, and compares the result with EEGLAB's math:
 So when you migrate already-processed data with `--ica reuse`, MNE reproduces
 EEGLAB's ICA cleaning exactly.
 
+### Filtering (`pop_eegfiltnew`)
+
+A real-EEGLAB comparison caught a silent mismatch in v0.2: EEGLAB designs a
+1–30 Hz bandpass with a ~1 Hz transition band at *both* edges, while MNE's
+defaults use 7.5 Hz at the 30 Hz edge (correlation 0.998, up to 12.8 µV off).
+The translation now reproduces EEGLAB's own design rules — transition band,
+filter order, Hamming window, cutoffs and edge padding — and is checked against
+a line-by-line port of EEGLAB's firfilt plugin:
+
+| Check | Result |
+|---|---|
+| Filter coefficients, MNE vs EEGLAB `firws` (1–30 Hz, 128 Hz) | identical |
+| Filtered data: bandpass, highpass, lowpass, band-stop, fixed order, `boundary` events | max relative difference < 10⁻¹² |
+
 ## Pitfalls it handles
 
 - **Units.** EEGLAB baselines are in ms and amplitudes in µV; MNE uses s and V.
@@ -104,7 +121,7 @@ EEGLAB's ICA cleaning exactly.
 - **ICA refits.** A fresh ICA in Python gives different components in a different order. The tool warns, and turns any hard-coded `pop_subcomp` numbers after a refit into a `TODO` rather than removing the wrong components.
 - **Rejected components.** `mne.preprocessing.read_ica_eeglab` loads EEGLAB's decomposition but not which components were flagged. In `--ica reuse` mode the generated code also recovers `EEG.reject.gcompreject`.
 - **Reference channels.** `pop_reref` removes the new reference channels unless `'keepref','on'`; MNE keeps them. The translation drops them to match.
-- **Filters.** `revfilt` becomes a band-stop; an explicit `filtorder` becomes `filter_length = order + 1`.
+- **Filters.** `pop_eegfiltnew` and MNE's `filter()` pick different transition bands by default, which silently changes your data. The translation computes EEGLAB's transition band and filter order and pads data edges the way EEGLAB does, so the filter is identical. `revfilt` becomes a band-stop, `filtorder` is honoured, and filtering restarts at `boundary` events.
 - **Epoching.** `pop_epoch` doesn't baseline-correct, so `baseline=None` (MNE's default would).
 - **Translating a `.set` file.** History paths point at the original author's machine, so loads of that dataset are redirected to your file; epoched datasets are read as `mne.Epochs`; steps made moot by a later reload of the same file are marked superseded; and an ICA computed *before* the recorded history is still loaded.
 
@@ -144,7 +161,8 @@ rate, baseline, ICLabel output shape, carried-over rejected components).
 ## Roadmap
 
 - [x] Numerical validation of ICA reuse against EEGLAB's tutorial dataset
-- [ ] Numerical validation of the remaining steps (filtering, resampling, re-referencing) against EEGLAB output, so every "approximate" grade becomes a measured number
+- [x] Exact `pop_eegfiltnew` filtering, validated against EEGLAB
+- [ ] Numerical validation of the remaining steps (resampling, CleanLine, interpolation) against EEGLAB output, so every "approximate" grade becomes a measured number
 - [ ] Translate `clean_rawdata` directly to pyprep + ASR with matched parameters
 - [ ] ERPLAB functions (`pop_binlister`, `pop_averager`)
 - [ ] `STUDY` scripts → MNE-BIDS / group loops

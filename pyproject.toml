@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "eeglab2mne"
-version = "0.2.0"
+version = "0.3.0"
 description = "Translate EEGLAB pipelines into auditable MNE-Python code"
 readme = "README.md"
 license = "MIT"

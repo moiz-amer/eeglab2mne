@@ -393,13 +393,38 @@ def _interp(call: Call, ctx: Context) -> Step:
 # ---- filtering / resampling / referencing ---------------------------------
 
 
-@translates("pop_eegfiltnew", "pop_eegfilt")
-def _filter(call: Call, ctx: Context) -> Step:
-    legacy = call.func.lower() == "pop_eegfilt"
+def _eegfiltnew_plan(lo, hi, revfilt: bool):
+    """Mirror pop_eegfiltnew's own case analysis (firfilt plugin).
+
+    Returns (l_freq, h_freq, df_expr) where df_expr is Python source for the
+    default transition band width, written in terms of ``_fs`` (the sampling
+    rate at run time) exactly as pop_eegfiltnew computes it.
+    """
+    def num(v):
+        return lit(v)
+
+    if lo is not None and hi is not None:
+        if not revfilt:  # bandpass
+            df = f"min(max({num(lo)} * 0.25, 2), min({num(lo)}, _fs / 2 - {num(hi)}))"
+            return lo, hi, df
+        max_df = (hi - lo) / 2  # bandstop: MNE treats l_freq > h_freq as band-stop
+        return hi, lo, f"min(max({num(max_df)} * 0.25, 2), {num(max_df)})"
+    edge = lo if lo is not None else hi
+    # pop_eegfiltnew turns a lone locutoff into an inverted lowpass (= highpass);
+    # revfilt flips it again.
+    highpass = (lo is not None) != revfilt
+    if highpass:
+        return edge, None, f"min(max({num(edge)} * 0.25, 2), {num(edge)})"
+    return None, edge, f"min(max({num(edge)} * 0.25, 2), _fs / 2 - {num(edge)})"
+
+
+@translates("pop_eegfiltnew")
+def _eegfiltnew(call: Call, ctx: Context) -> Step:
     lo = pos(call, 0, "locutoff")
     hi = pos(call, 1, "hicutoff")
     order = pos(call, 2, "filtorder")
     revfilt = truthy(pos(call, 3, "revfilt", 0))
+    minphase = truthy(pos(call, 6, "minphase", 0))
     lo = None if is_empty(lo) or lo == 0 else lo
     hi = None if is_empty(hi) or hi == 0 else hi
     if lo is None and hi is None:
@@ -407,32 +432,58 @@ def _filter(call: Call, ctx: Context) -> Step:
     for v in (lo, hi, order):
         if isinstance(v, Expr):
             raise NeedsManual(f"cutoff/order given as expression `{v.text}`")
+    if minphase:
+        raise NeedsManual("minimum-phase filtering ('minphase', 1)")
 
-    if revfilt:
-        if lo is not None and hi is not None:
-            l_freq, h_freq = hi, lo  # MNE: l_freq > h_freq means band-stop
-        elif lo is not None:
-            l_freq, h_freq = None, lo  # inverted high-pass = low-pass
-        else:
-            l_freq, h_freq = hi, None  # inverted low-pass = high-pass
+    l_freq, h_freq, df_expr = _eegfiltnew_plan(lo, hi, revfilt)
+    o = ctx.obj
+    ctx.imports.add("import numpy as np")
+    code = ["# Reproduce pop_eegfiltnew's design: one Hamming windowed-sinc filter whose order",
+            "# comes from the transition band, rounded up to even (firfilt plugin rules).",
+            f"_fs = {o}.info['sfreq']"]
+    if is_empty(order):
+        code += [f"_df = {df_expr}  # EEGLAB's default transition band (Hz)",
+                 "_order = int(np.ceil(3.3 / (_df / _fs) / 2) * 2)"]
     else:
-        l_freq, h_freq = lo, hi
+        code += [f"_order = {int(order)}  # 'filtorder' from the script"]
+    code.append("_df = 3.3 / _order * _fs  # transition band EEGLAB actually uses")
+    trans = []
+    if l_freq is not None:
+        trans.append("l_trans_bandwidth=_df")
+    if h_freq is not None:
+        trans.append("h_trans_bandwidth=_df")
+    code.append(f"{o}.filter(l_freq={lit(l_freq)}, h_freq={lit(h_freq)}, {', '.join(trans)}, "
+                "filter_length=_order + 1, method='fir', fir_design='firwin', "
+                "fir_window='hamming', phase='zero', pad='edge', "
+                "skip_by_annotation=('edge', 'bad_acq_skip', 'boundary'))")
+    notes = ["Same filter as EEGLAB: transition band, filter length, Hamming window, cutoffs "
+             "and edge padding all follow pop_eegfiltnew/firfilt. Filter coefficients are "
+             "identical; validated against EEGLAB output (see README).",
+             "Filtering restarts at 'boundary' events, as EEGLAB's firfilt does."]
+    if revfilt and lo is not None and hi is not None:
+        notes.append("revfilt=1 with two edges is a band-stop: MNE treats l_freq > h_freq as stop-band.")
+    if pos(call, 5, "usefftfilt", 0) and truthy(pos(call, 5, "usefftfilt", 0)):
+        notes.append("'usefftfilt' only changes how EEGLAB computes the convolution, not the result.")
+    return _step(call, Status.EXACT, code, notes)
 
-    extra = ""
-    if not is_empty(order) and not legacy:
-        extra = f", filter_length={int(order) + 1}"  # EEGLAB order = taps - 1
-    code = [f"{ctx.obj}.filter(l_freq={lit(l_freq)}, h_freq={lit(h_freq)}, method='fir', "
-            f"fir_design='firwin', fir_window='hamming', phase='zero'{extra})"]
-    notes = ["Both are zero-phase windowed-sinc FIR (Hamming) defined by pass-band edges. "
-             "MNE's 'auto' transition band is min(max(0.25*f, 2 Hz), f); check it matches the "
-             "'transition bandwidth' EEGLAB printed in its log, and pass l_trans_bandwidth/"
-             "h_trans_bandwidth explicitly if not."]
-    if revfilt:
-        notes.append("revfilt=1 (notch/inverted) translated as band-stop: MNE treats l_freq > h_freq as stop-band.")
-    if legacy:
-        notes.append("pop_eegfilt is EEGLAB's *legacy* least-squares filter. MNE has no equivalent; this "
-                     "substitutes the modern windowed-sinc design, so expect visible differences.")
-    return _step(call, Status.APPROX, code, notes)
+
+@translates("pop_eegfilt")
+def _eegfilt_legacy(call: Call, ctx: Context) -> Step:
+    lo = pos(call, 0, "locutoff")
+    hi = pos(call, 1, "hicutoff")
+    lo = None if is_empty(lo) or lo == 0 else lo
+    hi = None if is_empty(hi) or hi == 0 else hi
+    if lo is None and hi is None:
+        raise NeedsManual("no cutoff frequencies found")
+    for v in (lo, hi):
+        if isinstance(v, Expr):
+            raise NeedsManual(f"cutoff given as expression `{v.text}`")
+    code = [f"{ctx.obj}.filter(l_freq={lit(lo)}, h_freq={lit(hi)}, method='fir', "
+            "fir_design='firwin', fir_window='hamming', phase='zero')"]
+    return _step(call, Status.APPROX, code,
+                 ["pop_eegfilt is EEGLAB's *legacy* least-squares filter. MNE has no equivalent; this "
+                  "substitutes a windowed-sinc design, so expect visible differences. Consider "
+                  "switching the original pipeline to pop_eegfiltnew."])
 
 
 @translates("pop_resample")
@@ -635,6 +686,9 @@ def _runica(call: Call, ctx: Context) -> Step:
         fit_params = f", fit_params=dict(extended={truthy(call.get('extended', 0))})"
     n = call.get("pca", call.get("pcakeep"))
     n_comp = lit(n) if not is_empty(n) and not isinstance(n, Expr) else "None"
+    steps = call.get("maxsteps")
+    max_iter = str(int(steps)) if isinstance(steps, (int, float)) and not isinstance(steps, bool) \
+        else "'auto'"
     ctx.ica_refit = True
     ctx.warnings.append(
         "ICA is refit in Python. Component order and signs will NOT match EEGLAB, so any "
@@ -642,7 +696,7 @@ def _runica(call: Call, ctx: Context) -> Step:
         "(ICLabel or by eye), or run with --ica reuse to load EEGLAB's decomposition.")
     return _step(call, Status.APPROX,
                  [f"ica = mne.preprocessing.ICA(n_components={n_comp}, method={method!r}{fit_params}, "
-                  "random_state=97, max_iter='auto')",
+                  f"random_state=97, max_iter={max_iter})",
                   f"ica.fit({ctx.obj})"],
                  ["ICA is stochastic and implementations differ (EEGLAB runica vs MNE infomax "
                   "start values, stopping rules, PCA). Expect similar but not identical components."])

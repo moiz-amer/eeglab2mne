@@ -13,21 +13,30 @@ def one(src, **kw):
     return steps[0], t
 
 
-def test_filter_bandpass():
+def test_filter_bandpass_is_exact_eeglab_design():
     s, _ = one("EEG = pop_eegfiltnew(EEG, 'locutoff', 1, 'hicutoff', 40);")
-    assert s.status is Status.APPROX
-    assert "l_freq=1, h_freq=40" in s.code[0]
+    assert s.status is Status.EXACT
+    call = s.code[-1]
+    assert "l_freq=1, h_freq=40" in call
+    assert "l_trans_bandwidth=_df, h_trans_bandwidth=_df" in call  # same band at both edges
+    assert "pad='edge'" in call
 
 
 def test_filter_positional_with_order():
     s, _ = one("EEG = pop_eegfiltnew(EEG, 0.1, [], 3300);")
-    assert "l_freq=0.1, h_freq=None" in s.code[0]
-    assert "filter_length=3301" in s.code[0]  # EEGLAB order = taps - 1
+    assert "_order = 3300" in "\n".join(s.code)
+    assert "l_freq=0.1, h_freq=None" in s.code[-1]
+    assert "filter_length=_order + 1" in s.code[-1]  # EEGLAB order = taps - 1
 
 
 def test_filter_revfilt_is_bandstop():
     s, _ = one("EEG = pop_eegfiltnew(EEG, 'locutoff', 48, 'hicutoff', 52, 'revfilt', 1);")
-    assert "l_freq=52, h_freq=48" in s.code[0]
+    assert "l_freq=52, h_freq=48" in s.code[-1]
+
+
+def test_legacy_eegfilt_stays_approximate():
+    s, _ = one("EEG = pop_eegfilt(EEG, 1, 40);")
+    assert s.status is Status.APPROX
 
 
 def test_average_reference():
@@ -141,3 +150,8 @@ def test_prior_ica_warns_in_refit_mode():
     info = {"path": "x.set", "epoched": False, "has_ica": True}
     t = translate("EEG = eeg_checkset(EEG);", set_info=info)
     assert any("--ica reuse" in w for w in t.ctx.warnings)
+
+
+def test_runica_maxsteps_becomes_max_iter():
+    s, _ = one("EEG = pop_runica(EEG, 'extended', 1, 'maxsteps', 300);")
+    assert "max_iter=300" in s.code[0]

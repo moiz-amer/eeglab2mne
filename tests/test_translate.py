@@ -155,3 +155,51 @@ def test_prior_ica_warns_in_refit_mode():
 def test_runica_maxsteps_becomes_max_iter():
     s, _ = one("EEG = pop_runica(EEG, 'extended', 1, 'maxsteps', 300);")
     assert "max_iter=300" in s.code[0]
+
+
+LOOP_SCRIPT = r"""
+subjects = {'sub01', 'sub02'};
+for s = 1:length(subjects)
+    EEG = pop_loadset('filename', [subjects{s} '.set'], 'filepath', datapath);
+    EEG = pop_biosig(fullfile(rawpath, [subjects{s} '.bdf']));
+    EEG = pop_runica(EEG, 'extended', 1);
+    EEG = pop_saveset(EEG, 'filename', [subjects{s} '_clean.set'], 'filepath', outpath);
+end
+"""
+
+
+@pytest.mark.parametrize("mode", ["refit", "reuse"])
+def test_variable_paths_still_generate_valid_python(mode):
+    # Regression: a '# TODO' inside an expression used to comment out the rest of the line.
+    ast.parse(translate(LOOP_SCRIPT, ica_mode=mode).to_python())
+
+
+def test_variable_paths_are_manual_not_exact():
+    t = translate(LOOP_SCRIPT)
+    by_func = {s.func: s for s in t.steps if s.call}
+    for func in ("pop_loadset", "pop_biosig", "pop_saveset"):
+        assert by_func[func].status is Status.MANUAL, func
+    assert "INPUT_SET = None  # TODO" in by_func["pop_loadset"].code[0]
+
+
+def test_saveset_with_variable_name_does_not_use_a_fixed_file():
+    # Regression: every subject in a loop used to be saved to the same 'output-raw.fif'.
+    t = translate(LOOP_SCRIPT)
+    save = next(s for s in t.steps if s.call and s.func == "pop_saveset")
+    assert "'output-" not in "\n".join(save.code)
+    assert "save(OUTPUT_FILE" in "\n".join(save.code)
+
+
+def test_saveset_keeps_folder_and_resave_uses_loaded_name():
+    t = translate("EEG = pop_loadset('filename', 'a.set', 'filepath', 'data/');\n"
+                  "EEG = pop_saveset(EEG, 'filename', 'b.set', 'filepath', 'out/');\n"
+                  "EEG = pop_saveset(EEG, 'savemode', 'resave');")
+    assert "'out/b-raw.fif'" in t.steps[1].code[0]
+    assert "'data/a-raw.fif'" in t.steps[2].code[0]
+
+
+def test_control_flow_gets_a_clear_note():
+    t = translate(LOOP_SCRIPT)
+    for s in t.steps:
+        if s.source.split()[0] in ("for", "end"):
+            assert "control flow" in s.notes[0]

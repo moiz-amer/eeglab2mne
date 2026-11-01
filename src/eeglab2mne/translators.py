@@ -78,6 +78,16 @@ def lit(v: Any) -> str:
     return repr(v)
 
 
+def placeholder(name: str, what: str, original: Any) -> str:
+    """A standalone line defining a placeholder the user must fill in.
+
+    Placeholders always get their own line: a ``# TODO`` comment inside an
+    expression would comment out the rest of the generated line.
+    """
+    shown = original.text if isinstance(original, Expr) else repr(original)
+    return f"{name} = None  # TODO: {what} (MATLAB: {shown})"
+
+
 def is_empty(v: Any) -> bool:
     return v is None or (isinstance(v, list) and len(v) == 0)
 
@@ -190,8 +200,15 @@ def _loadset(call: Call, ctx: Context) -> Step:
     notes: list[str] = []
     info = ctx.set_info
     epoched = None
+    pre: list[str] = []
+    status = Status.EXACT
     if isinstance(fname, Expr) or isinstance(fpath, Expr):
-        fname_code = "INPUT_SET  # TODO: set path (was a MATLAB variable)"
+        pre = [placeholder("INPUT_SET", "path to the .set file",
+                           fname if isinstance(fname, Expr) else fpath)]
+        fname_code = "INPUT_SET"
+        status = Status.MANUAL
+        notes.append("The file name is built from MATLAB variables, so the path has to be set by "
+                     "hand (in a loop, build it from your subject list).")
     elif info and str(fname).replace("\\", "/").split("/")[-1] == Path(info["path"]).name:
         # The history records paths on the machine that made it; point at the real file.
         fname_code = lit(info["path"])
@@ -207,23 +224,27 @@ def _loadset(call: Call, ctx: Context) -> Step:
 
     if epoched:
         ctx.obj = "epochs"
-        code = [f"epochs = mne.read_epochs_eeglab({fname_code})"]
+        code = pre + [f"epochs = mne.read_epochs_eeglab({fname_code})"]
         notes.append("Dataset is epoched (EEG.trials > 1), so it is read as mne.Epochs.")
     else:
         ctx.obj = "raw"
-        code = [f"raw = mne.io.read_raw_eeglab({fname_code}, preload=True)"]
+        code = pre + [f"raw = mne.io.read_raw_eeglab({fname_code}, preload=True)"]
         if epoched is None:
             notes.append("If this .set is already epoched, use mne.read_epochs_eeglab() instead "
                          "and rename `raw` to `epochs`.")
     notes.append("Channel types: EEGLAB marks everything as EEG; set EOG/ECG with set_channel_types().")
-    return _step(call, Status.EXACT, code, notes)
+    return _step(call, status, code, notes)
 
 
 @translates("pop_biosig", "pop_fileio", "pop_loadbv", "pop_readegi", "pop_loadcnt", "pop_loadeep")
 def _import(call: Call, ctx: Context) -> Step:
     fname = call.positional[0] if call.positional else call.get("filename")
     if fname is None or isinstance(fname, Expr):
-        code = ["raw = mne.io.read_raw(INPUT_FILE, preload=True)  # TODO: set path"]
+        ctx.obj = "raw"
+        return _step(call, Status.MANUAL,
+                     [placeholder("INPUT_FILE", "path to the recording", fname),
+                      "raw = mne.io.read_raw(INPUT_FILE, preload=True)"],
+                     ["The file name is built from MATLAB variables, so set the path by hand."])
     else:
         code = [f"raw = mne.io.read_raw({lit(fname)}, preload=True)"]
     if call.func.lower() == "pop_loadbv" and len(call.positional) >= 2:
@@ -238,13 +259,26 @@ def _import(call: Call, ctx: Context) -> Step:
 
 @translates("pop_saveset")
 def _saveset(call: Call, ctx: Context) -> Step:
-    fname = call.get("filename", "output.set")
-    stem = fname.rsplit(".", 1)[0] if isinstance(fname, str) else "output"
+    fname = call.get("filename")
+    fpath = call.get("filepath", "")
     suffix = "epo" if ctx.obj == "epochs" else "raw"
-    return _step(call, Status.EXACT,
-                 [f"{ctx.obj}.save({stem + '-' + suffix + '.fif'!r}, overwrite=True)",
-                  f"# Or keep EEGLAB format: mne.export.export_raw/export_epochs(..., fmt='eeglab')"],
-                 ["Saved as .fif (MNE native). Exporting back to .set needs the eeglabio package."])
+    export = "# Or keep EEGLAB format: mne.export.export_raw/export_epochs(..., fmt='eeglab')"
+    notes = ["Saved as .fif (MNE native). Exporting back to .set needs the eeglabio package."]
+    if isinstance(fname, Expr) or isinstance(fpath, Expr):
+        return _step(call, Status.MANUAL,
+                     [placeholder("OUTPUT_FILE", f"output path, ending in -{suffix}.fif",
+                                  fname if isinstance(fname, Expr) else fpath),
+                      f"{ctx.obj}.save(OUTPUT_FILE, overwrite=True)", export],
+                     ["The file name is built from MATLAB variables. Set it by hand: in a loop over "
+                      "subjects, a fixed name would overwrite the same file every time."] + notes)
+    if fname is None:  # 'savemode','resave' or no name: save next to the loaded file
+        base = ctx.input_path or "output.set"
+        fpath, fname = "", base
+    stem = str(fname).rsplit(".", 1)[0]
+    out = stem + f"-{suffix}.fif"
+    if fpath:
+        out = str(fpath).rstrip("/\\") + "/" + out
+    return _step(call, Status.EXACT, [f"{ctx.obj}.save({out!r}, overwrite=True)", export], notes)
 
 
 # ---- channels -------------------------------------------------------------
@@ -660,8 +694,9 @@ def ica_reuse_code(ctx: Context) -> list[str]:
     ctx.imports.add("from pymatreader import read_mat")
     ctx.imports.add("import numpy as np")
     src_path = ctx.ica_source or ctx.input_path
-    src = lit(src_path) if src_path else "ICA_SET  # TODO: .set file holding the ICA"
-    return [f"ica_set = {src}",
+    first = (f"ica_set = {lit(src_path)}" if src_path else
+             "ica_set = None  # TODO: path to the .set file that holds EEGLAB's ICA")
+    return [first,
             "ica = mne.preprocessing.read_ica_eeglab(ica_set)",
             "# read_ica_eeglab does not carry over components flagged for rejection,",
             "# so recover EEG.reject.gcompreject ourselves:",
@@ -675,7 +710,10 @@ def ica_reuse_code(ctx: Context) -> list[str]:
 def _runica(call: Call, ctx: Context) -> Step:
     ctx.has_ica = True
     if ctx.ica_mode == "reuse":
-        return _step(call, Status.EXACT, ica_reuse_code(ctx), [ICA_REUSE_NOTE])
+        known = bool(ctx.ica_source or ctx.input_path)
+        return _step(call, Status.EXACT if known else Status.MANUAL, ica_reuse_code(ctx),
+                     [ICA_REUSE_NOTE] + ([] if known else
+                                         ["Set ica_set to the .set file holding EEGLAB's ICA."]))
 
     icatype = str(call.get("icatype", "runica")).lower()
     method = _ICA_METHODS.get(icatype)
@@ -775,7 +813,15 @@ def _selectcomps(call: Call, ctx: Context) -> Step:
 # --------------------------------------------------------------------------
 
 
+CONTROL_FLOW = {"for", "parfor", "while", "if", "elseif", "else", "end", "switch", "case",
+                "otherwise", "try", "catch", "function", "return", "break", "continue"}
+CONTROL_NOTE = ("MATLAB control flow (loop, condition or function). The steps inside are "
+                "translated; wrap them in the matching Python block (for/if/def) by hand.")
+
+
 def translate_call(call: Call, ctx: Context) -> Step:
+    if call.func in CONTROL_FLOW:
+        return _step(call, Status.MANUAL, [f"# TODO: {call.source}"], [CONTROL_NOTE])
     if not call.args and call.func in ("EEG", "ALLEEG", "OUTEEG"):
         return _step(call, Status.SKIPPED,
                      notes=["Dataset copy. MNE methods modify in place; use .copy() if you need the "

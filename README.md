@@ -28,7 +28,8 @@ Nothing is silently dropped: anything the tool can't translate becomes a
 ## Quick start
 
 ```bash
-pip install "eeglab2mne[run]"     # [run] adds MNE + mne-icalabel to execute the output
+pip install "eeglab2mne[run] @ git+https://github.com/moiz-amer/eeglab2mne"
+# [run] adds MNE + mne-icalabel to execute the output (needs Python 3.10–3.14)
 
 # translate a script
 eeglab2mne preprocess.m -o preprocess_mne.py --report migration_report.md

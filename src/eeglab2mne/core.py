@@ -8,7 +8,7 @@ from pathlib import Path
 
 from . import __version__
 from .parser import Call, parse_script
-from .translators import ICA_REUSE_NOTE, Context, Status, Step, ica_reuse_code, translate_call
+from .translators import CONTROL_FLOW, CONTROL_NOTE, ICA_REUSE_NOTE, Context, Status, Step, ica_reuse_code, translate_call
 
 _BADGE = {
     Status.EXACT: "✅ exact",
@@ -62,8 +62,10 @@ def translate(text: str, *, ica_mode: str = "refit", source_name: str = "<script
         if isinstance(item, Call):
             steps.append(translate_call(item, ctx))
         else:
-            steps.append(Step(None, item, 0, Status.MANUAL, [f"# TODO: {item}"],
-                              ["Not a function call (assignment, loop or expression); translate by hand."]))
+            first = item.split(None, 1)[0] if item.split() else ""
+            note = (CONTROL_NOTE if first in CONTROL_FLOW else
+                    "Not a function call (assignment or expression); translate by hand.")
+            steps.append(Step(None, item, 0, Status.MANUAL, [f"# TODO: {item}"], [note]))
 
     if set_info:
         _mark_superseded(steps, set_info["path"])

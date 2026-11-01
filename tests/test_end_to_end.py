@@ -89,3 +89,37 @@ def test_strict_mode_fails_on_manual_steps(tmp_path):
     m.write_text("EEG = pop_clean_rawdata(EEG, 'BurstCriterion', 20);")
     assert main([str(m), "-o", str(tmp_path / "o.py"), "--strict"]) == 2
     assert main([str(m), "-o", str(tmp_path / "o.py")]) == 0
+
+
+def test_translated_subject_loop_runs_and_saves_each_subject(eeglab_set, tmp_path):
+    """A typical multi-subject script: variables, a loop, per-subject file names."""
+    import shutil
+
+    for sub in ("sub01", "sub02"):
+        for ext in (".set", ".fdt"):
+            src = eeglab_set.with_suffix(ext)
+            if src.exists():
+                shutil.copy(src, tmp_path / (sub + ext))
+    src = f"""
+datapath = '{tmp_path}';
+outpath = fullfile(datapath, 'clean');
+subjects = {{'sub01', 'sub02'}};
+for s = 1:length(subjects)
+    EEG = pop_loadset('filename', [subjects{{s}} '.set'], 'filepath', datapath);
+    EEG = pop_select(EEG, 'nochannel', {{'HEOG'}});
+    EEG = pop_eegfiltnew(EEG, 'locutoff', 1, 'hicutoff', 30);
+    if s == 2
+        EEG = pop_resample(EEG, 250);
+    end
+    EEG = pop_saveset(EEG, 'filename', [subjects{{s}} '_clean.set'], 'filepath', outpath);
+end
+"""
+    (tmp_path / "clean").mkdir()
+    t = translate(src)
+    assert not [st for st in t.steps if st.status.value == "manual"]
+    _run(t.to_python(), tmp_path)
+    import mne
+    a = mne.io.read_raw_fif(tmp_path / "clean" / "sub01_clean-raw.fif", verbose=False)
+    b = mne.io.read_raw_fif(tmp_path / "clean" / "sub02_clean-raw.fif", verbose=False)
+    assert a.info["sfreq"] == 500 and b.info["sfreq"] == 250  # each subject saved separately
+    assert "HEOG" not in a.ch_names

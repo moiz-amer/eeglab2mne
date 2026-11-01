@@ -14,7 +14,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 
+from .matlab_expr import ExprEnv, ExprError, to_python
 from .parser import Call, Expr
+
+
+@dataclass(frozen=True)
+class PyExpr:
+    """A MATLAB expression already translated to Python source."""
+
+    code: str
 
 
 class Status(str, Enum):
@@ -32,6 +40,8 @@ class Step:
     status: Status
     code: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    indent: int = 0  # block depth in the generated Python
+    structural: bool = False  # block bookkeeping (end, pass): no report row, no header
 
     @property
     def func(self) -> str:
@@ -53,6 +63,14 @@ class Context:
     # Facts read from the .set file being translated (when translating a .set):
     # {"path": str, "epoched": bool, "has_ica": bool}
     set_info: dict | None = None
+    # Variables defined earlier in the script (assignments, loop variables).
+    known_vars: set[str] = field(default_factory=set)
+    # Python code for the loaded file's path when it is built from variables.
+    input_path_code: str | None = None
+    uses_todo: bool = False  # generated code calls the TODO() helper
+
+    def env(self) -> ExprEnv:
+        return ExprEnv(known=self.known_vars, obj=self.obj, imports=self.imports)
 
 
 class NeedsManual(Exception):
@@ -66,6 +84,8 @@ class NeedsManual(Exception):
 
 def lit(v: Any) -> str:
     """Render a Python literal for generated code."""
+    if isinstance(v, PyExpr):
+        return v.code
     if isinstance(v, Expr):
         raise NeedsManual(f"MATLAB expression `{v.text}` must be resolved by hand")
     if isinstance(v, float):
@@ -86,6 +106,16 @@ def placeholder(name: str, what: str, original: Any) -> str:
     """
     shown = original.text if isinstance(original, Expr) else repr(original)
     return f"{name} = None  # TODO: {what} (MATLAB: {shown})"
+
+
+def path_code(ctx: Context, fpath: Any, fname: Any) -> str:
+    """Python source for EEGLAB's (filepath, filename) pair."""
+    if isinstance(fpath, PyExpr) or isinstance(fname, PyExpr):
+        if not fpath:
+            return lit(fname)
+        ctx.imports.add("import os")
+        return f"os.path.join({lit(fpath)}, {lit(fname)})"
+    return lit((str(fpath).rstrip("/\\") + "/" + str(fname)) if fpath else fname)
 
 
 def is_empty(v: Any) -> bool:
@@ -209,6 +239,9 @@ def _loadset(call: Call, ctx: Context) -> Step:
         status = Status.MANUAL
         notes.append("The file name is built from MATLAB variables, so the path has to be set by "
                      "hand (in a loop, build it from your subject list).")
+    elif isinstance(fname, PyExpr) or isinstance(fpath, PyExpr):
+        fname_code = path_code(ctx, fpath, fname)
+        ctx.input_path, ctx.input_path_code = None, fname_code
     elif info and str(fname).replace("\\", "/").split("/")[-1] == Path(info["path"]).name:
         # The history records paths on the machine that made it; point at the real file.
         fname_code = lit(info["path"])
@@ -220,7 +253,7 @@ def _loadset(call: Call, ctx: Context) -> Step:
     else:
         full = (fpath.rstrip("/\\") + "/" + fname) if fpath else fname
         fname_code = lit(full)
-        ctx.input_path = full
+        ctx.input_path, ctx.input_path_code = full, None
 
     if epoched:
         ctx.obj = "epochs"
@@ -245,12 +278,11 @@ def _import(call: Call, ctx: Context) -> Step:
                      [placeholder("INPUT_FILE", "path to the recording", fname),
                       "raw = mne.io.read_raw(INPUT_FILE, preload=True)"],
                      ["The file name is built from MATLAB variables, so set the path by hand."])
-    else:
-        code = [f"raw = mne.io.read_raw({lit(fname)}, preload=True)"]
+    code = [f"raw = mne.io.read_raw({lit(fname)}, preload=True)"]
     if call.func.lower() == "pop_loadbv" and len(call.positional) >= 2:
         p, f = call.positional[0], call.positional[1]
-        if isinstance(p, str) and isinstance(f, str):
-            code = [f"raw = mne.io.read_raw_brainvision({lit(p.rstrip('/') + '/' + f)}, preload=True)"]
+        if isinstance(p, (str, PyExpr)) and isinstance(f, (str, PyExpr)):
+            code = [f"raw = mne.io.read_raw_brainvision({path_code(ctx, p, f)}, preload=True)"]
     ctx.obj = "raw"
     return _step(call, Status.APPROX, code,
                  ["Readers differ in how they map event codes, channel types and units; "
@@ -271,6 +303,13 @@ def _saveset(call: Call, ctx: Context) -> Step:
                       f"{ctx.obj}.save(OUTPUT_FILE, overwrite=True)", export],
                      ["The file name is built from MATLAB variables. Set it by hand: in a loop over "
                       "subjects, a fixed name would overwrite the same file every time."] + notes)
+    if fname is None and ctx.input_path is None and ctx.input_path_code:
+        fname = PyExpr(ctx.input_path_code)  # resave a file loaded via variables
+    if isinstance(fname, PyExpr) or isinstance(fpath, PyExpr):
+        ctx.imports.add("import os")
+        name = f"os.path.splitext({lit(fname)})[0] + '-{suffix}.fif'"
+        out = f"os.path.join({lit(fpath)}, {name})" if fpath else name
+        return _step(call, Status.EXACT, [f"{ctx.obj}.save({out}, overwrite=True)", export], notes)
     if fname is None:  # 'savemode','resave' or no name: save next to the loaded file
         base = ctx.input_path or "output.set"
         fpath, fname = "", base
@@ -523,11 +562,34 @@ def _eegfilt_legacy(call: Call, ctx: Context) -> Step:
 @translates("pop_resample")
 def _resample(call: Call, ctx: Context) -> Step:
     fs = pos(call, 0, "freq")
+    fc = pos(call, 1, "fc", 0.9)
+    df = pos(call, 2, "df", 0.2)
+    fc = 0.9 if is_empty(fc) else fc
+    df = 0.2 if is_empty(df) else df
     if is_empty(fs):
         raise NeedsManual("no target rate")
-    return _step(call, Status.APPROX, [f"{ctx.obj}.resample({lit(fs)})"],
-                 ["Different anti-aliasing filters (EEGLAB: firfilt-based or MATLAB resample; "
-                  "MNE: FFT by default). Content well below the new Nyquist matches closely."])
+    if ctx.obj != "raw":
+        raise NeedsManual("resampling epoched data")
+    o = ctx.obj
+    ctx.imports.update({"import numpy as np", "from fractions import Fraction",
+                        "from scipy.signal import firwin"})
+    code = [
+        "# Reproduce pop_resample: Kaiser-window anti-aliasing filter designed by firfilt",
+        "# (pop_firwsord/firws), edge padding, then polyphase resampling.",
+        f"_ratio = Fraction({lit(fs)} / {o}.info['sfreq']).limit_denominator(10**6)",
+        "_p, _q = _ratio.numerator, _ratio.denominator",
+        f"_fc, _dfn = {lit(fc)} / max(_p, _q), {lit(df)} / max(_p, _q)",
+        "_m = int(np.ceil((1 + (-20 * np.log10(0.002) - 8) / (2.285 * 2 * np.pi * _dfn / 2)) / 2) * 2)",
+        "_b = firwin(_m + 1, _fc, window=('kaiser', 5))  # SciPy applies EEGLAB's gain of p itself",
+        f"{o}.resample({lit(fs)}, method='polyphase', window=_b, pad='edge')",
+    ]
+    return _step(call, Status.EXACT, code,
+                 ["Same anti-aliasing filter as EEGLAB (Kaiser window, beta 5, cutoff 0.9 x Nyquist, "
+                  "transition 0.2 x Nyquist, ripple 0.002) with edge padding.",
+                  "Matches EEGLAB when MATLAB's Signal Processing Toolbox is installed (EEGLAB then "
+                  "uses resample()); without it EEGLAB falls back to spline interpolation.",
+                  "EEGLAB resamples each segment between 'boundary' events separately; MNE "
+                  "resamples continuously, so results differ near boundaries."])
 
 
 @translates("pop_reref")
@@ -634,27 +696,55 @@ def _rejepoch(call: Call, ctx: Context) -> Step:
 def _epoch(call: Call, ctx: Context) -> Step:
     types = call.positional[0] if call.positional else []
     lims = call.positional[1] if len(call.positional) > 1 else call.get("timelim")
-    if not (isinstance(lims, list) and len(lims) == 2):
-        raise NeedsManual("epoch limits not a 2-element vector")
+    if not (isinstance(lims, list) and len(lims) == 2) or \
+            not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in lims):
+        raise NeedsManual("epoch limits not a 2-element vector of numbers")
+    if str(call.get("timeunit", "seconds")).lower() != "seconds":
+        raise NeedsManual("'timeunit' other than seconds")
     types = as_list(types)
     if any(isinstance(t, Expr) for t in types):
         raise NeedsManual("event types given as expressions")
     types = [str(int(t)) if isinstance(t, (int, float)) else t for t in types]
-    code = ["events, event_id = mne.events_from_annotations(raw)"]
-    if types:
-        code.append(f"event_id = {{k: v for k, v in event_id.items() if k in {lit(types)}}}")
-    code.append(f"epochs = mne.Epochs(raw, events, event_id=event_id, tmin={lit(lims[0])}, "
-                f"tmax={lit(lims[1])}, baseline=None, preload=True)")
-    notes = ["baseline=None because EEGLAB's pop_epoch does not baseline-correct; "
-             "pop_rmbase does that separately.",
-             "MNE includes the sample at tmax, so epochs may be one sample longer than EEGLAB's.",
-             "Event names come from EEG.event.type via read_raw_eeglab annotations; check "
-             "`event_id` if your types are numeric or padded (e.g. 'S  1')."]
+    src = ctx.obj
+    if src != "raw":
+        raise NeedsManual("epoching data that is already epoched")
+    ctx.imports.add("import numpy as np")
+    type_filter = f"if d in {lit(types)}" if types else "if d != 'boundary'"
+    code = [
+        "# Reproduce EEGLAB's epoch.m: limits rounded to whole samples (MATLAB rounding),",
+        "# last sample excluded, and each event placed at floor(latency) like EEGLAB.",
+        "_fs = raw.info['sfreq']",
+        "_mround = lambda x: int(np.sign(x) * np.floor(abs(x) + 0.5))",
+        f"_s0, _s1 = _mround({lit(lims[0])} * _fs), _mround({lit(lims[1])} * _fs - 1)",
+        "_ann = raw.annotations",
+        "_t0 = 0.0 if _ann.orig_time is None else raw.first_time",
+        f"event_id = {{d: i + 1 for i, d in enumerate(dict.fromkeys(d for d in _ann.description {type_filter}))}}",
+        "events = np.array([[int(np.floor((on - _t0) * _fs + 1e-6)) + raw.first_samp, 0, event_id[d]]",
+        "                   for on, d in zip(_ann.onset, _ann.description) if d in event_id],",
+        "                  dtype=int).reshape(-1, 3)",
+        "epochs = mne.Epochs(raw, events, event_id=event_id, tmin=_s0 / _fs, tmax=_s1 / _fs,",
+        "                    baseline=None, preload=True)",
+        "# EEGLAB discards epochs that span a data discontinuity ('boundary' event)",
+        "_bnd = [int(round((on - _t0) * _fs)) + raw.first_samp",
+        "        for on, d in zip(_ann.onset, _ann.description) if d == 'boundary']",
+        "if _bnd:",
+        "    epochs.drop([i for i, e in enumerate(epochs.events[:, 0])",
+        "                 if any(e + _s0 < b <= e + _s1 for b in _bnd)], reason='boundary')",
+    ]
+    notes = ["Same samples as EEGLAB: limits are rounded the way epoch.m does and the final "
+             "sample is excluded, so epochs have EEGLAB's length (e.g. [-1 2] s at 128 Hz gives "
+             "384 samples, not MNE's 385).",
+             "baseline=None because pop_epoch does not baseline-correct; pop_rmbase does.",
+             "Events are placed at floor(latency) as EEGLAB does, which matters after resampling "
+             "when latencies fall between samples."]
     if call.has("valuelim"):
         notes.append("'valuelim' (absolute amplitude rejection at epoching) not translated; "
                      "add a pop_eegthresh-style step.")
+        status = Status.APPROX
+    else:
+        status = Status.EXACT
     ctx.obj = "epochs"
-    return _step(call, Status.APPROX, code, notes)
+    return _step(call, status, code, notes)
 
 
 @translates("pop_rmbase")
@@ -694,8 +784,12 @@ def ica_reuse_code(ctx: Context) -> list[str]:
     ctx.imports.add("from pymatreader import read_mat")
     ctx.imports.add("import numpy as np")
     src_path = ctx.ica_source or ctx.input_path
-    first = (f"ica_set = {lit(src_path)}" if src_path else
-             "ica_set = None  # TODO: path to the .set file that holds EEGLAB's ICA")
+    if src_path:
+        first = f"ica_set = {lit(src_path)}"
+    elif ctx.input_path_code:
+        first = f"ica_set = {ctx.input_path_code}"
+    else:
+        first = "ica_set = None  # TODO: path to the .set file that holds EEGLAB's ICA"
     return [first,
             "ica = mne.preprocessing.read_ica_eeglab(ica_set)",
             "# read_ica_eeglab does not carry over components flagged for rejection,",
@@ -710,7 +804,7 @@ def ica_reuse_code(ctx: Context) -> list[str]:
 def _runica(call: Call, ctx: Context) -> Step:
     ctx.has_ica = True
     if ctx.ica_mode == "reuse":
-        known = bool(ctx.ica_source or ctx.input_path)
+        known = bool(ctx.ica_source or ctx.input_path or ctx.input_path_code)
         return _step(call, Status.EXACT if known else Status.MANUAL, ica_reuse_code(ctx),
                      [ICA_REUSE_NOTE] + ([] if known else
                                          ["Set ica_set to the .set file holding EEGLAB's ICA."]))
@@ -830,7 +924,42 @@ def translate_call(call: Call, ctx: Context) -> Step:
     if fn is None:
         return _step(call, Status.MANUAL, [f"# TODO: no translation for `{call.func}`: {call.source}"],
                      [f"`{call.func}` is not in the translation table yet."])
+    _resolve_expressions(call, ctx)
     try:
         return fn(call, ctx)
     except NeedsManual as e:
         return _step(call, Status.MANUAL, [f"# TODO: {call.source}"], [str(e)])
+    except (TypeError, ValueError, AttributeError):
+        # A variable reached a step that needs a literal value (e.g. arithmetic on it).
+        return _step(call, Status.MANUAL, [f"# TODO: {call.source}"],
+                     ["An argument comes from a variable this step can't use yet; translate by hand."])
+
+
+_DATASET_NAMES = {"EEG", "ALLEEG", "EEGOUT", "OUTEEG", "CURRENTSET", "ALLCOM", "LASTCOM"}
+
+
+def _resolve_expressions(call: Call, ctx: Context) -> None:
+    """Replace MATLAB expressions in a call's arguments with Python when possible."""
+    def has_expr(v: Any) -> bool:
+        return isinstance(v, Expr) or (isinstance(v, list) and any(has_expr(x) for x in v))
+
+    def conv(v: Any) -> Any:
+        if isinstance(v, Expr) and v.text not in _DATASET_NAMES:
+            try:
+                return PyExpr(to_python(v.text, ctx.env()))
+            except ExprError:
+                return v
+        if isinstance(v, list):
+            text = getattr(v, "text", "")
+            if text and has_expr(v):
+                # e.g. [subjects{s} '.set']: translate the whole MATLAB expression
+                try:
+                    return PyExpr(to_python(text, ctx.env()))
+                except ExprError:
+                    pass
+            return [conv(x) for x in v]
+        return v
+
+    call.positional = [conv(v) for v in call.positional]
+    call.pairs = [(k, conv(v)) for k, v in call.pairs]
+    call.kwargs = dict(call.pairs)

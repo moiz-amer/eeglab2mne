@@ -65,7 +65,8 @@ def test_baseline_ms_to_seconds():
 def test_epoching_switches_object_and_skips_baseline():
     s, t = one("EEG = pop_epoch(EEG, {'S  1'}, [-0.2 0.8]);")
     assert t.ctx.obj == "epochs"
-    assert "baseline=None" in s.code[-1]
+    assert "baseline=None" in "\n".join(s.code)
+    assert s.status is Status.EXACT
 
 
 def test_threshold_uses_microvolts_not_peak_to_peak():
@@ -198,8 +199,56 @@ def test_saveset_keeps_folder_and_resave_uses_loaded_name():
     assert "'data/a-raw.fif'" in t.steps[2].code[0]
 
 
-def test_control_flow_gets_a_clear_note():
-    t = translate(LOOP_SCRIPT)
-    for s in t.steps:
-        if s.source.split()[0] in ("for", "end"):
-            assert "control flow" in s.notes[0]
+def test_loop_and_conditions_become_python_blocks():
+    src = ("subjects = {'a', 'b'};\n"
+           "for s = 1:length(subjects)\n"
+           "  if strcmp(subjects{s}, 'a')\n"
+           "    EEG = pop_reref(EEG, []);\n"
+           "  elseif s > 1\n"
+           "    EEG = pop_resample(EEG, 250);\n"
+           "  else\n"
+           "    disp('x');\n"
+           "  end\n"
+           "end\n")
+    code = translate(src).to_python()
+    ast.parse(code)
+    assert "for s in range(1, len(subjects) + 1):" in code
+    assert "    if (subjects[s - 1] == 'a'):" in code
+    assert "    elif s > 1:" in code
+    assert "        pass" in code  # empty else-branch stays valid Python
+
+
+def test_switch_becomes_if_chain():
+    src = ("cond = 'rest';\nswitch cond\n  case 'rest'\n    EEG = pop_reref(EEG, []);\n"
+           "  case {'task', 'oddball'}\n    EEG = pop_resample(EEG, 250);\n"
+           "  otherwise\n    disp('?');\nend\n")
+    code = translate(src).to_python()
+    ast.parse(code)
+    assert "if cond == 'rest':" in code
+    assert "elif cond in ['task', 'oddball']:" in code
+    assert "else:" in code
+
+
+def test_untranslatable_condition_fails_loudly_not_silently():
+    # An unknown variable must not be guessed; the script stops with a clear error instead.
+    t = translate("if someWorkspaceVar > 3\n  EEG = pop_reref(EEG, []);\nend\n")
+    code = t.to_python()
+    ast.parse(code)
+    assert "if TODO('someWorkspaceVar > 3'):" in code
+    assert "def TODO(what):" in code
+    assert t.steps[0].status is Status.MANUAL
+
+
+def test_unknown_variable_in_path_is_not_assumed():
+    t = translate("EEG = pop_loadset('filename', 'a.set', 'filepath', datapath);")
+    assert t.steps[0].status is Status.MANUAL  # datapath only exists in someone's workspace
+
+
+def test_expressions_in_paths():
+    t = translate("subjects = {'s1'};\ns = 1;\n"
+                  "EEG = pop_loadset('filename', sprintf('%s_task.set', subjects{s}), "
+                  "'filepath', fullfile('data', 'raw'));")
+    step = t.steps[-1]
+    assert step.status is Status.EXACT
+    assert ("os.path.join(os.path.join('data', 'raw'), ('%s_task.set' % (subjects[s - 1],)))"
+            in step.code[0])

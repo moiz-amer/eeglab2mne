@@ -33,6 +33,22 @@ class Expr:
         return f"Expr({self.text!r})"
 
 
+class MatList(list):
+    """A list parsed from ``[...]`` or ``{...}`` that remembers its MATLAB source.
+
+    Needed because ``[name '.set']`` is a list of parts to the parser but a
+    string concatenation to MATLAB; the expression translator decides.
+    """
+
+    text: str = ""
+
+
+def _matlist(items: list, text: str) -> MatList:
+    out = MatList(items)
+    out.text = text
+    return out
+
+
 @dataclass
 class Call:
     """One EEGLAB statement, e.g. ``EEG = pop_resample(EEG, 250);``."""
@@ -325,8 +341,8 @@ def parse_value(token: str) -> Any:
                     flat.extend(item)
                 else:
                     flat.append(item)
-            return flat
-        return parsed_rows
+            return _matlist(flat, t)
+        return _matlist(parsed_rows, t)
 
     return Expr(t)
 

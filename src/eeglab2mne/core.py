@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import __version__
-from .parser import Call, parse_script
-from .translators import CONTROL_FLOW, CONTROL_NOTE, ICA_REUSE_NOTE, Context, Status, Step, ica_reuse_code, translate_call
+from .matlab_expr import ExprError, range_to_python, to_python
+from .parser import Call, parse_script, split_statements
+from .translators import (CONTROL_FLOW, CONTROL_NOTE, ICA_REUSE_NOTE, REGISTRY, Context, Status,
+                          Step, ica_reuse_code, translate_call)
 
 _BADGE = {
     Status.EXACT: "✅ exact",
@@ -26,7 +29,7 @@ class Translation:
 
     @property
     def counts(self) -> Counter:
-        return Counter(s.status for s in self.steps)
+        return Counter(s.status for s in self.steps if not s.structural)
 
     def to_python(self) -> str:
         return render_python(self)
@@ -57,17 +60,12 @@ def translate(text: str, *, ica_mode: str = "refit", source_name: str = "<script
     if ica_mode not in ("refit", "reuse"):
         raise ValueError("ica_mode must be 'refit' or 'reuse'")
     ctx = Context(ica_mode=ica_mode, ica_source=ica_source, set_info=set_info)
-    steps: list[Step] = []
-    for item in parse_script(text):
-        if isinstance(item, Call):
-            steps.append(translate_call(item, ctx))
-        else:
-            first = item.split(None, 1)[0] if item.split() else ""
-            note = (CONTROL_NOTE if first in CONTROL_FLOW else
-                    "Not a function call (assignment or expression); translate by hand.")
-            steps.append(Step(None, item, 0, Status.MANUAL, [f"# TODO: {item}"], [note]))
+    builder = _Builder(ctx)
+    for line, stmt in split_statements(text):
+        builder.add(line, stmt)
+    steps = builder.finish()
 
-    if set_info:
+    if set_info and not any(st.indent for st in steps):
         _mark_superseded(steps, set_info["path"])
 
     # The dataset may carry an ICA computed before its recorded history began.
@@ -82,6 +80,213 @@ def translate(text: str, *, ica_mode: str = "refit", source_name: str = "<script
             ctx.warnings.append("This dataset contains an ICA decomposition that is not in its "
                                 "history. Run with --ica reuse to load it.")
     return Translation(steps, ctx, source_name)
+
+
+TODO_HELPER = [
+    "def TODO(what):",
+    "    \"\"\"Stops the script where eeglab2mne could not translate MATLAB code.\"\"\"",
+    "    raise NotImplementedError(f'eeglab2mne: translate this MATLAB code by hand: {what}')",
+]
+
+_ASSIGN_RE = re.compile(r"^([A-Za-z_]\w*)\s*=(?!=)\s*(.+)$", re.DOTALL)
+_FUNC_RE = re.compile(r"^function\s+(?:(\[[^\]]*\]|[A-Za-z_]\w*)\s*=\s*)?([A-Za-z_]\w*)\s*(?:\(([^)]*)\))?$")
+
+
+class _Builder:
+    """Turns MATLAB statements into Steps, tracking Python block structure."""
+
+    def __init__(self, ctx: Context):
+        self.ctx = ctx
+        self.steps: list[Step] = []
+        # Open blocks: dicts with kind, has_body, and (switch) subject/seen_case.
+        self.blocks: list[dict] = []
+
+    # -- structure -----------------------------------------------------------
+    @property
+    def depth(self) -> int:
+        return sum(1 for b in self.blocks if b["kind"] != "switch" or b.get("in_case"))
+
+    def emit(self, step: Step) -> None:
+        step.indent = self.depth
+        if step.code and self.blocks:
+            self.blocks[-1]["has_body"] = True
+        self.steps.append(step)
+
+    def ensure_body(self) -> None:
+        if self.blocks and not self.blocks[-1]["has_body"]:
+            self.steps.append(Step(None, "pass", 0, Status.SKIPPED, ["pass"],
+                                   indent=self.depth, structural=True))
+            self.blocks[-1]["has_body"] = True
+
+    def todo(self, what: str) -> str:
+        self.ctx.uses_todo = True
+        return f"TODO({what!r})"
+
+    def expr(self, text: str) -> tuple[str, bool]:
+        try:
+            return to_python(text.strip(), self.ctx.env()), True
+        except ExprError:
+            return self.todo(text.strip()), False
+
+    def opener(self, line: int, src: str, code: str, ok: bool, kind: str, note: str) -> None:
+        self.emit(Step(None, src, line, Status.EXACT if ok else Status.MANUAL, [code],
+                       [note] if ok else [note, "Could not translate this part automatically; "
+                                                "the script stops here with a TODO error until you do."]))
+        self.blocks.append({"kind": kind, "has_body": False})
+
+    # -- statements ----------------------------------------------------------
+    def add(self, line: int, stmt: str) -> None:
+        stmt = stmt.strip().rstrip(";").strip()
+        if not stmt:
+            return
+        word = stmt.split(None, 1)[0].split("(")[0]
+        rest = stmt[len(word):].strip()
+        if word in CONTROL_FLOW:
+            self.control(line, stmt, word, rest)
+            return
+        m = _ASSIGN_RE.match(stmt)
+        if m and not stmt.startswith("[") and m.group(1) not in ("EEG", "ALLEEG"):
+            rhs_func = re.match(r"^([A-Za-z_]\w*)\s*\(", m.group(2).strip())
+            if not (rhs_func and rhs_func.group(1).lower() in REGISTRY):
+                self.assignment(line, stmt, m.group(1), m.group(2))
+                return
+        items = parse_script(stmt)
+        for item in items:
+            if isinstance(item, Call):
+                item.line = line
+                self.emit(translate_call(item, self.ctx))
+            else:
+                self.emit(Step(None, item, line, Status.MANUAL, [f"# TODO: {item}"],
+                               ["Not a function call (assignment or expression); translate by hand."]))
+
+    def assignment(self, line: int, stmt: str, name: str, rhs: str) -> None:
+        if rhs.strip() in ("EEG", "ALLEEG"):
+            self.emit(Step(None, stmt, line, Status.SKIPPED, [],
+                           ["Dataset copy. MNE methods modify in place; use .copy() if you need "
+                            "the original later."]))
+            return
+        try:
+            code = to_python(rhs.strip(), self.ctx.env())
+        except ExprError as e:
+            self.ctx.known_vars.add(name)  # later uses fail loudly via TODO, not NameError
+            self.emit(Step(None, stmt, line, Status.MANUAL, [f"{name} = {self.todo(rhs.strip())}"],
+                           [f"Could not translate the right-hand side ({e})."]))
+            return
+        self.ctx.known_vars.add(name)
+        self.emit(Step(None, stmt, line, Status.EXACT, [f"{name} = {code}"],
+                       ["Variable assignment."]))
+
+    def control(self, line: int, stmt: str, word: str, rest: str) -> None:
+        ctx = self.ctx
+        if word in ("for", "parfor"):
+            inner = rest[1:-1] if rest.startswith("(") and rest.endswith(")") else rest
+            m = re.match(r"^\s*([A-Za-z_]\w*)\s*=\s*(.+)$", inner)
+            if m:
+                var, rng = m.group(1), m.group(2)
+                try:
+                    it, ok = range_to_python(rng, ctx.env()), True
+                except ExprError:
+                    it, ok = self.todo(rng), False
+                ctx.known_vars.add(var)
+                self.opener(line, stmt, f"for {var} in {it}:", ok, "for",
+                            "Loop. MATLAB ranges include the end value, so range() goes one past it.")
+            else:
+                self.opener(line, stmt, f"for _ in {self.todo(rest)}:", False, "for", "Loop.")
+        elif word == "while":
+            cond, ok = self.expr(rest)
+            self.opener(line, stmt, f"while {cond}:", ok, "while", "Loop.")
+        elif word == "if":
+            cond, ok = self.expr(rest)
+            self.opener(line, stmt, f"if {cond}:", ok, "if", "Condition.")
+        elif word in ("elseif", "else"):
+            if not self.blocks or self.blocks[-1]["kind"] != "if":
+                self.emit(Step(None, stmt, line, Status.MANUAL, [f"# TODO: {stmt}"], [CONTROL_NOTE]))
+                return
+            self.ensure_body()
+            self.blocks.pop()
+            if word == "else":
+                self.opener(line, stmt, "else:", True, "if", "Condition.")
+            else:
+                cond, ok = self.expr(rest)
+                self.opener(line, stmt, f"elif {cond}:", ok, "if", "Condition.")
+        elif word == "switch":
+            subject, ok = self.expr(rest)
+            self.emit(Step(None, stmt, line, Status.EXACT if ok else Status.MANUAL, [],
+                           ["switch/case becomes an if/elif chain."], structural=True))
+            self.blocks.append({"kind": "switch", "has_body": True, "subject": subject,
+                                "seen_case": False, "in_case": False})
+        elif word in ("case", "otherwise"):
+            sw = self.blocks[-1] if self.blocks else None
+            if not sw or sw["kind"] != "switch":
+                self.emit(Step(None, stmt, line, Status.MANUAL, [f"# TODO: {stmt}"], [CONTROL_NOTE]))
+                return
+            if sw["in_case"]:
+                self.ensure_body()
+            sw["in_case"] = False
+            if word == "otherwise":
+                code, ok = ("else:" if sw["seen_case"] else "if True:"), True
+            else:
+                value, ok = self.expr(rest)
+                test = f"{sw['subject']} in {value}" if value.startswith("[") else \
+                    f"{sw['subject']} == {value}"
+                code = f"{'elif' if sw['seen_case'] else 'if'} {test}:"
+            self.emit(Step(None, stmt, line, Status.EXACT if ok else Status.MANUAL, [code],
+                           ["switch/case becomes an if/elif chain."]))
+            sw.update(seen_case=True, in_case=True, has_body=False)
+        elif word == "try":
+            self.opener(line, stmt, "try:", True, "try", "Error handling.")
+        elif word == "catch":
+            if not self.blocks or self.blocks[-1]["kind"] != "try":
+                self.emit(Step(None, stmt, line, Status.MANUAL, [f"# TODO: {stmt}"], [CONTROL_NOTE]))
+                return
+            self.ensure_body()
+            self.blocks.pop()
+            var = rest.split()[0] if rest else ""
+            if var:
+                ctx.known_vars.add(var)
+            self.opener(line, stmt, f"except Exception{' as ' + var if var else ''}:", True, "try",
+                        "Error handling.")
+        elif word == "function":
+            m = _FUNC_RE.match(stmt)
+            if not m:
+                self.emit(Step(None, stmt, line, Status.MANUAL, [f"# TODO: {stmt}"], [CONTROL_NOTE]))
+                return
+            outs = [o for o in re.split(r"[\s,]+", (m.group(1) or "").strip("[]")) if o]
+            params = [a.strip() for a in (m.group(3) or "").split(",") if a.strip()]
+            ctx.known_vars.update(params)
+            self.opener(line, stmt, f"def {m.group(2)}({', '.join(params)}):", True, "function",
+                        "Function definition.")
+            self.blocks[-1]["outs"] = outs
+        elif word == "end":
+            if not self.blocks:
+                self.emit(Step(None, stmt, line, Status.MANUAL, [f"# TODO: {stmt}"], [CONTROL_NOTE]))
+                return
+            block = self.blocks[-1]
+            if block["kind"] == "switch":
+                if block["in_case"]:
+                    self.ensure_body()
+                self.blocks.pop()
+                return
+            if block["kind"] == "function" and block.get("outs"):
+                self.emit(Step(None, "(function outputs)", line, Status.EXACT,
+                               [f"return {', '.join(block['outs'])}"], [], structural=True))
+            self.ensure_body()
+            self.blocks.pop()
+        elif word in ("return", "break", "continue"):
+            self.emit(Step(None, stmt, line, Status.EXACT, [word], [], structural=True))
+        else:
+            self.emit(Step(None, stmt, line, Status.MANUAL, [f"# TODO: {stmt}"], [CONTROL_NOTE]))
+
+    def finish(self) -> list[Step]:
+        while self.blocks:  # unterminated blocks (e.g. a function file without 'end')
+            block = self.blocks[-1]
+            if block["kind"] == "switch":
+                if block["in_case"]:
+                    self.ensure_body()
+            else:
+                self.ensure_body()
+            self.blocks.pop()
+        return self.steps
 
 
 def _mark_superseded(steps: list[Step], set_path: str) -> None:
@@ -162,17 +367,23 @@ def render_python(t: Translation) -> str:
     ]
     lines += sorted(t.ctx.imports, key=lambda s: (not s.startswith("import"), s))
     lines += ["", ""]
+    if t.ctx.uses_todo:
+        lines += TODO_HELPER + ["", ""]
     for w in t.ctx.warnings:
         lines.append(f"# WARNING: {w}")
     if t.ctx.warnings:
         lines.append("")
     for s in t.steps:
-        if s.status is Status.SKIPPED and not s.code:
+        if not s.code:
             continue
-        loc = f"L{s.line}: " if s.line else ""
-        lines.append(f"# --- {loc}{_one_line(s.source)}  [{s.status.value}]")
-        lines += s.code
-        lines.append("")
+        pad = "    " * s.indent
+        if not s.structural:
+            loc = f"L{s.line}: " if s.line else ""
+            lines.append(f"{pad}# --- {loc}{_one_line(s.source)}  [{s.status.value}]")
+        for chunk in s.code:
+            lines += [pad + ln if ln else ln for ln in chunk.split("\n")]
+        if not s.structural and not s.code[-1].rstrip().endswith(":"):
+            lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -203,7 +414,7 @@ def render_report(t: Translation) -> str:
         out += ["## ⚠️ Pipeline-level warnings", ""] + [f"- {w}" for w in t.ctx.warnings] + [""]
 
     out += ["## Step by step", "", "| # | Line | EEGLAB | Status | Notes |", "|---|---|---|---|---|"]
-    for i, s in enumerate(t.steps, 1):
+    for i, s in enumerate([s for s in t.steps if not s.structural], 1):
         notes = "<br>".join(_md(n) for n in s.notes)
         out.append(f"| {i} | {s.line or ''} | `{_md(_one_line(s.source, 70))}` | {_BADGE[s.status]} | {notes} |")
     out.append("")

@@ -46,7 +46,7 @@ From Python:
 from eeglab2mne import translate
 
 t = translate(open("preprocess.m").read())
-print(t.counts)          # Counter({exact: 9, approximate: 6, manual: 2, skipped: 4})
+print(t.counts)          # Counter({exact: 11, approximate: 4, manual: 2, skipped: 4})
 open("pipeline.py", "w").write(t.to_python())
 ```
 
@@ -115,6 +115,56 @@ a line-by-line port of EEGLAB's firfilt plugin:
 | Filtered data: bandpass, highpass, lowpass, band-stop, fixed order, `boundary` events | max relative difference < 10⁻¹² |
 | **Same script in real EEGLAB (MATLAB) vs translated MNE code**: load → 1–30 Hz filter → average reference → epoch → baseline, 80 epochs | correlation 1.000000, max difference < 0.001 µV (before the fix: 0.998 and 12.8 µV) |
 
+### Resampling and epoching (`pop_resample`, `pop_epoch`)
+
+`pop_resample` uses its own anti-aliasing filter (Kaiser window, designed by
+firfilt) with edge padding; MNE's default resampler is FFT-based. `pop_epoch`
+rounds its limits to whole samples, drops the final sample and places events at
+`floor(latency)`; MNE's defaults keep one extra sample and round latencies.
+Both translations now reproduce EEGLAB, checked against NumPy ports of
+`pop_resample.m` (with MATLAB's `resample`) and `epoch.m`:
+
+| Check | Result |
+|---|---|
+| Resampling 500 Hz → 250, 128 and 1000 Hz | max relative difference < 10⁻⁹ |
+| Epochs after resampling, with event latencies between samples | identical samples (relative difference < 10⁻⁹) |
+| Epoch length, `[-1 2]` s at 128 Hz | 384 samples, as in EEGLAB's tutorial dataset (MNE's default: 385) |
+
+## Loops, conditions and variables
+
+Real preprocessing scripts loop over subjects and build file names from
+variables. These translate into ordinary Python:
+
+```matlab
+datapath = '/data/study';
+subjects = {'sub01', 'sub02'};
+for s = 1:length(subjects)
+    EEG = pop_loadset('filename', [subjects{s} '.set'], 'filepath', datapath);
+    if strcmp(subjects{s}, 'sub02')
+        EEG = pop_resample(EEG, 250);
+    end
+    EEG = pop_saveset(EEG, 'filename', [subjects{s} '_clean.set'], 'filepath', datapath);
+end
+```
+
+```python
+datapath = '/data/study'
+subjects = ['sub01', 'sub02']
+for s in range(1, len(subjects) + 1):
+    raw = mne.io.read_raw_eeglab(os.path.join(datapath, subjects[s - 1] + '.set'), preload=True)
+    if (subjects[s - 1] == 'sub02'):
+        ...  # EEGLAB's resampling
+    raw.save(os.path.join(datapath, os.path.splitext(subjects[s - 1] + '_clean.set')[0] + '-raw.fif'), overwrite=True)
+```
+
+Supported: `for`, `while`, `if`/`elseif`/`else`, `switch`/`case`, `try`/`catch`,
+simple assignments, cell arrays, `{}`/`()` indexing (converted to 0-based),
+string concatenation, `fullfile`, `sprintf`, `num2str`, `strcmp`, `length` and
+`EEG.srate`/`EEG.nbchan`/`EEG.pnts`. A variable is only used if the script
+defines it; anything else becomes `TODO(...)`, which stops the generated script
+with a clear message instead of guessing. See the full
+[loop example](examples/subject_loop.m) → [generated Python](examples/subject_loop_mne.py).
+
 ## Pitfalls it handles
 
 - **Units.** EEGLAB baselines are in ms and amplitudes in µV; MNE uses s and V.
@@ -124,7 +174,8 @@ a line-by-line port of EEGLAB's firfilt plugin:
 - **Rejected components.** `mne.preprocessing.read_ica_eeglab` loads EEGLAB's decomposition but not which components were flagged. In `--ica reuse` mode the generated code also recovers `EEG.reject.gcompreject`.
 - **Reference channels.** `pop_reref` removes the new reference channels unless `'keepref','on'`; MNE keeps them. The translation drops them to match.
 - **Filters.** `pop_eegfiltnew` and MNE's `filter()` pick different transition bands by default, which silently changes your data. The translation computes EEGLAB's transition band and filter order and pads data edges the way EEGLAB does, so the filter is identical. `revfilt` becomes a band-stop, `filtorder` is honoured, and filtering restarts at `boundary` events.
-- **Epoching.** `pop_epoch` doesn't baseline-correct, so `baseline=None` (MNE's default would).
+- **Epoching.** `pop_epoch` doesn't baseline-correct, so `baseline=None` (MNE's default would). Epochs have EEGLAB's exact samples and length, and epochs spanning a `boundary` are dropped as EEGLAB does.
+- **Resampling.** EEGLAB's anti-aliasing filter is reproduced instead of MNE's FFT default.
 - **Translating a `.set` file.** History paths point at the original author's machine, so loads of that dataset are redirected to your file; epoched datasets are read as `mne.Epochs`; steps made moot by a later reload of the same file are marked superseded; and an ICA computed *before* the recorded history is still loaded.
 
 ## Supported EEGLAB functions
@@ -164,7 +215,9 @@ rate, baseline, ICLabel output shape, carried-over rejected components).
 
 - [x] Numerical validation of ICA reuse against EEGLAB's tutorial dataset
 - [x] Exact `pop_eegfiltnew` filtering, validated against EEGLAB
-- [ ] Numerical validation of the remaining steps (resampling, CleanLine, interpolation) against EEGLAB output, so every "approximate" grade becomes a measured number
+- [x] Exact `pop_resample` and `pop_epoch`
+- [x] Loops, conditions and variables
+- [ ] Exact CleanLine and spherical-spline interpolation (`pop_interp`)
 - [ ] Translate `clean_rawdata` directly to pyprep + ASR with matched parameters
 - [ ] ERPLAB functions (`pop_binlister`, `pop_averager`)
 - [ ] `STUDY` scripts → MNE-BIDS / group loops

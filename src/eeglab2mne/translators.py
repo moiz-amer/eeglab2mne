@@ -68,6 +68,7 @@ class Context:
     # Python code for the loaded file's path when it is built from variables.
     input_path_code: str | None = None
     uses_todo: bool = False  # generated code calls the TODO() helper
+    helpers: dict[str, str] = field(default_factory=dict)  # functions emitted once at the top
 
     def env(self) -> ExprEnv:
         return ExprEnv(known=self.known_vars, obj=self.obj, imports=self.imports)
@@ -559,6 +560,37 @@ def _eegfilt_legacy(call: Call, ctx: Context) -> Step:
                   "switching the original pipeline to pop_eegfiltnew."])
 
 
+EEGLAB_RESAMPLE = '''def eeglab_resample(raw, sfreq, fc=0.9, df=0.2):
+    """Resample like EEGLAB's pop_resample (Signal Processing Toolbox branch).
+
+    Same anti-aliasing filter as EEGLAB (firfilt: Kaiser window, beta 5, ripple
+    0.002), same edge padding, and the same rational ratio p/q. MNE's own
+    raw.resample() derives its ratio from sample counts, which only matches
+    EEGLAB when the recording length divides evenly, so it is not used here.
+    """
+    ratio = Fraction(sfreq / raw.info['sfreq']).limit_denominator(10**6)
+    p, q = ratio.numerator, ratio.denominator
+    fc, df = fc / max(p, q), df / max(p, q)
+    m = int(np.ceil((1 + (-20 * np.log10(0.002) - 8) / (2.285 * 2 * np.pi * df / 2)) / 2) * 2)
+    b = firwin(m + 1, fc, window=('kaiser', 5))  # resample_poly applies EEGLAB's gain p
+    npad = int(np.ceil((m / 2) / q) * q)
+    x = np.pad(raw.get_data(), ((0, 0), (npad, npad)), mode='edge')
+    y = resample_poly(x, p, q, axis=-1, window=b, padtype='constant')
+    cut = npad * p // q
+    y = y[:, cut:y.shape[1] - cut]
+    new = mne.io.RawArray(y, mne.create_info(raw.ch_names, sfreq, raw.get_channel_types()),
+                          verbose=False)
+    new.set_meas_date(raw.info['meas_date'])
+    montage = raw.get_montage()
+    if montage is not None:
+        new.set_montage(montage, on_missing='ignore')
+    new.info['bads'] = list(raw.info['bads'])
+    if raw.info['projs']:
+        new.add_proj(raw.info['projs'])
+    new.set_annotations(raw.annotations)
+    return new'''
+
+
 @translates("pop_resample")
 def _resample(call: Call, ctx: Context) -> Step:
     fs = pos(call, 0, "freq")
@@ -570,25 +602,16 @@ def _resample(call: Call, ctx: Context) -> Step:
         raise NeedsManual("no target rate")
     if ctx.obj != "raw":
         raise NeedsManual("resampling epoched data")
-    o = ctx.obj
     ctx.imports.update({"import numpy as np", "from fractions import Fraction",
-                        "from scipy.signal import firwin"})
-    code = [
-        "# Reproduce pop_resample: Kaiser-window anti-aliasing filter designed by firfilt",
-        "# (pop_firwsord/firws), edge padding, then polyphase resampling.",
-        f"_ratio = Fraction({lit(fs)} / {o}.info['sfreq']).limit_denominator(10**6)",
-        "_p, _q = _ratio.numerator, _ratio.denominator",
-        f"_fc, _dfn = {lit(fc)} / max(_p, _q), {lit(df)} / max(_p, _q)",
-        "_m = int(np.ceil((1 + (-20 * np.log10(0.002) - 8) / (2.285 * 2 * np.pi * _dfn / 2)) / 2) * 2)",
-        "_b = firwin(_m + 1, _fc, window=('kaiser', 5))  # SciPy applies EEGLAB's gain of p itself",
-        f"{o}.resample({lit(fs)}, method='polyphase', window=_b, pad='edge')",
-    ]
-    return _step(call, Status.EXACT, code,
-                 ["Same anti-aliasing filter as EEGLAB (Kaiser window, beta 5, cutoff 0.9 x Nyquist, "
-                  "transition 0.2 x Nyquist, ripple 0.002) with edge padding.",
+                        "from scipy.signal import firwin, resample_poly"})
+    ctx.helpers["eeglab_resample"] = EEGLAB_RESAMPLE
+    extra = "" if (fc, df) == (0.9, 0.2) else f", fc={lit(fc)}, df={lit(df)}"
+    return _step(call, Status.EXACT, [f"raw = eeglab_resample(raw, {lit(fs)}{extra})"],
+                 ["Same anti-aliasing filter, padding and ratio as EEGLAB's pop_resample "
+                  "(see the eeglab_resample() helper at the top of the script).",
                   "Matches EEGLAB when MATLAB's Signal Processing Toolbox is installed (EEGLAB then "
                   "uses resample()); without it EEGLAB falls back to spline interpolation.",
-                  "EEGLAB resamples each segment between 'boundary' events separately; MNE "
+                  "EEGLAB resamples each segment between 'boundary' events separately; this "
                   "resamples continuously, so results differ near boundaries."])
 
 

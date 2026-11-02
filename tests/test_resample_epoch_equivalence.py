@@ -97,16 +97,23 @@ def _raw(fs=500.0, seconds=30, onsets=None):
 def _exec(src, raw):
     t = translate(src)
     ns = {"raw": raw}
+    exec("\n".join(sorted(t.ctx.imports)), ns)
+    for helper in t.ctx.helpers.values():
+        exec(helper, ns)
     for step in t.steps:
-        exec("\n".join(sorted(t.ctx.imports)), ns)
         exec("\n".join(step.code), ns)
     return t, ns
 
 
-@pytest.mark.parametrize("new_fs", [250, 128, 1000])
-def test_resample_matches_eeglab(new_fs):
-    raw = _raw()
-    expected = eeglab_resample(raw.get_data() * 1e6, 500.0, new_fs)
+@pytest.mark.parametrize("fs, seconds, new_fs", [
+    (500.0, 30, 250), (500.0, 30, 128), (500.0, 30, 1000),
+    # Regression: lengths that don't divide evenly (EEGLAB's tutorial file is 30504
+    # samples at 128 Hz). MNE's raw.resample() then used a wrong ratio and gain.
+    (128.0, 30504 / 128, 100), (500.0, 30.007, 128), (250.0, 41.001, 100),
+])
+def test_resample_matches_eeglab(fs, seconds, new_fs):
+    raw = _raw(fs=fs, seconds=seconds)
+    expected = eeglab_resample(raw.get_data() * 1e6, fs, new_fs)
     t, ns = _exec(f"EEG = pop_resample(EEG, {new_fs});", raw)
     got = ns["raw"].get_data() * 1e6
     assert t.steps[0].status.value == "exact"

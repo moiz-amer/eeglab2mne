@@ -369,6 +369,8 @@ def render_python(t: Translation) -> str:
     lines += ["", ""]
     if t.ctx.uses_todo:
         lines += TODO_HELPER + ["", ""]
+    for helper in t.ctx.helpers.values():
+        lines += helper.split("\n") + ["", ""]
     for w in t.ctx.warnings:
         lines.append(f"# WARNING: {w}")
     if t.ctx.warnings:

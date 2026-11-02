@@ -118,7 +118,10 @@ a line-by-line port of EEGLAB's firfilt plugin:
 ### Resampling and epoching (`pop_resample`, `pop_epoch`)
 
 `pop_resample` uses its own anti-aliasing filter (Kaiser window, designed by
-firfilt) with edge padding; MNE's default resampler is FFT-based. `pop_epoch`
+firfilt) with edge padding; MNE's default resampler is FFT-based, and MNE's
+polyphase option derives its ratio from sample counts (which breaks EEGLAB's
+filter whenever the length doesn't divide evenly). The generated code therefore
+includes a small `eeglab_resample()` helper that resamples exactly like EEGLAB. `pop_epoch`
 rounds its limits to whole samples, drops the final sample and places events at
 `floor(latency)`; MNE's defaults keep one extra sample and round latencies.
 Both translations now reproduce EEGLAB, checked against NumPy ports of
@@ -126,7 +129,7 @@ Both translations now reproduce EEGLAB, checked against NumPy ports of
 
 | Check | Result |
 |---|---|
-| Resampling 500 Hz → 250, 128 and 1000 Hz | max relative difference < 10⁻⁹ |
+| Resampling 500 Hz → 250, 128 and 1000 Hz, and recording lengths that don't divide evenly (e.g. 30504 samples, 128 → 100 Hz) | max relative difference < 10⁻⁹ |
 | Epochs after resampling, with event latencies between samples | identical samples (relative difference < 10⁻⁹) |
 | Epoch length, `[-1 2]` s at 128 Hz | 384 samples, as in EEGLAB's tutorial dataset (MNE's default: 385) |
 

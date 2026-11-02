@@ -131,7 +131,7 @@ Both translations now reproduce EEGLAB, checked against NumPy ports of
 |---|---|
 | Resampling 500 Hz → 250, 128 and 1000 Hz, and recording lengths that don't divide evenly (e.g. 30504 samples, 128 → 100 Hz) | max relative difference < 10⁻⁹ |
 | Epochs after resampling, with event latencies between samples | identical samples (relative difference < 10⁻⁹) |
-| Epoch length, `[-1 2]` s at 128 Hz | 384 samples, as in EEGLAB's tutorial dataset (MNE's default: 385) |
+| Epoch length, `[-1 2]` s at 128 Hz | 384 samples, as in EEGLAB's tutorial dataset (MNE's default: 385) || **Same script in real EEGLAB (MATLAB, Signal Processing Toolbox) vs translated MNE code**: load → resample 128 → 100 Hz → 1–30 Hz filter → average reference → epoch → baseline, 80 epochs | correlation 1.000000, max difference < 0.001 µV (before v0.4.1: 0.04) |
 
 ## Loops, conditions and variables
 

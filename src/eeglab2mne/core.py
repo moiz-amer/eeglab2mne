@@ -5,7 +5,7 @@ from __future__ import annotations
 import keyword
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import __version__
@@ -13,7 +13,8 @@ from .matlab_expr import ExprError, range_to_python, to_python
 from .parser import Call, parse_script, split_statements
 from .scanner import scan
 from .translators import (CONTROL_FLOW, CONTROL_NOTE, HISTORY_PATH_NOTE, ICA_REUSE_NOTE, REGISTRY,
-                          Context, Status, Step, ica_reuse_code, translate_call)
+                          Context, SetInfo, Status, Step, ica_reuse_code,
+                          translate_call)
 
 _BADGE = {
     Status.EXACT: "✅ exact",
@@ -41,7 +42,7 @@ class Translation:
 
 
 def translate(text: str, *, ica_mode: str = "refit", source_name: str = "<script>",
-              ica_source: str | None = None, set_info: dict | None = None) -> Translation:
+              ica_source: str | None = None, set_info: SetInfo | None = None) -> Translation:
     """Translate EEGLAB MATLAB code into a :class:`Translation`.
 
     Parameters
@@ -68,7 +69,7 @@ def translate(text: str, *, ica_mode: str = "refit", source_name: str = "<script
     steps = builder.finish()
 
     if set_info and not any(st.indent for st in steps):
-        _mark_superseded(steps, set_info["path"])
+        _mark_superseded(steps)
 
     # Paths in a .set history were chosen by whoever made the file: surface the risky ones.
     for st in steps:
@@ -108,31 +109,42 @@ def _is_ident(name: str) -> bool:
 _FUNC_RE = re.compile(r"^function\s+(?:(\[[^\]]*\]|[A-Za-z_]\w*)\s*=\s*)?([A-Za-z_]\w*)\s*(?:\(([^)]*)\))?$")
 
 
+@dataclass
+class _Block:
+    """An open MATLAB block (for/if/switch/try/function) while building Python."""
+
+    kind: str
+    has_body: bool = False  # Python needs at least one statement per block
+    subject: str = ""  # switch: the translated expression being switched on
+    seen_case: bool = False  # switch: a case was emitted (next one is elif)
+    in_case: bool = False  # switch: inside a case body (adds an indent level)
+    outs: list[str] = field(default_factory=list)  # function: output names to return
+
+
 class _Builder:
     """Turns MATLAB statements into Steps, tracking Python block structure."""
 
     def __init__(self, ctx: Context):
         self.ctx = ctx
         self.steps: list[Step] = []
-        # Open blocks: dicts with kind, has_body, and (switch) subject/seen_case.
-        self.blocks: list[dict] = []
+        self.blocks: list[_Block] = []
 
     # -- structure -----------------------------------------------------------
     @property
     def depth(self) -> int:
-        return sum(1 for b in self.blocks if b["kind"] != "switch" or b.get("in_case"))
+        return sum(1 for b in self.blocks if b.kind != "switch" or b.in_case)
 
     def emit(self, step: Step) -> None:
         step.indent = self.depth
         if step.code and self.blocks:
-            self.blocks[-1]["has_body"] = True
+            self.blocks[-1].has_body = True
         self.steps.append(step)
 
     def ensure_body(self) -> None:
-        if self.blocks and not self.blocks[-1]["has_body"]:
+        if self.blocks and not self.blocks[-1].has_body:
             self.steps.append(Step(None, "pass", 0, Status.SKIPPED, ["pass"],
                                    indent=self.depth, structural=True))
-            self.blocks[-1]["has_body"] = True
+            self.blocks[-1].has_body = True
 
     def todo(self, what: str) -> str:
         self.ctx.uses_todo = True
@@ -148,7 +160,7 @@ class _Builder:
         self.emit(Step(None, src, line, Status.EXACT if ok else Status.MANUAL, [code],
                        [note] if ok else [note, "Could not translate this part automatically; "
                                                 "the script stops here with a TODO error until you do."]))
-        self.blocks.append({"kind": kind, "has_body": False})
+        self.blocks.append(_Block(kind))
 
     # -- statements ----------------------------------------------------------
     def add(self, line: int, stmt: str) -> None:
@@ -215,7 +227,7 @@ class _Builder:
             cond, ok = self.expr(rest)
             self.opener(line, stmt, f"if {cond}:", ok, "if", "Condition.")
         elif word in ("elseif", "else"):
-            if not self.blocks or self.blocks[-1]["kind"] != "if":
+            if not self.blocks or self.blocks[-1].kind != "if":
                 self.emit(Step(None, stmt, line, Status.MANUAL, [f"# TODO: {stmt}"], [CONTROL_NOTE]))
                 return
             self.ensure_body()
@@ -229,30 +241,29 @@ class _Builder:
             subject, ok = self.expr(rest)
             self.emit(Step(None, stmt, line, Status.EXACT if ok else Status.MANUAL, [],
                            ["switch/case becomes an if/elif chain."], structural=True))
-            self.blocks.append({"kind": "switch", "has_body": True, "subject": subject,
-                                "seen_case": False, "in_case": False})
+            self.blocks.append(_Block("switch", has_body=True, subject=subject))
         elif word in ("case", "otherwise"):
             sw = self.blocks[-1] if self.blocks else None
-            if not sw or sw["kind"] != "switch":
+            if not sw or sw.kind != "switch":
                 self.emit(Step(None, stmt, line, Status.MANUAL, [f"# TODO: {stmt}"], [CONTROL_NOTE]))
                 return
-            if sw["in_case"]:
+            if sw.in_case:
                 self.ensure_body()
-            sw["in_case"] = False
+            sw.in_case = False
             if word == "otherwise":
-                code, ok = ("else:" if sw["seen_case"] else "if True:"), True
+                code, ok = ("else:" if sw.seen_case else "if True:"), True
             else:
                 value, ok = self.expr(rest)
-                test = f"{sw['subject']} in {value}" if value.startswith("[") else \
-                    f"{sw['subject']} == {value}"
-                code = f"{'elif' if sw['seen_case'] else 'if'} {test}:"
+                test = f"{sw.subject} in {value}" if value.startswith("[") else \
+                    f"{sw.subject} == {value}"
+                code = f"{'elif' if sw.seen_case else 'if'} {test}:"
             self.emit(Step(None, stmt, line, Status.EXACT if ok else Status.MANUAL, [code],
                            ["switch/case becomes an if/elif chain."]))
-            sw.update(seen_case=True, in_case=True, has_body=False)
+            sw.seen_case, sw.in_case, sw.has_body = True, True, False
         elif word == "try":
             self.opener(line, stmt, "try:", True, "try", "Error handling.")
         elif word == "catch":
-            if not self.blocks or self.blocks[-1]["kind"] != "try":
+            if not self.blocks or self.blocks[-1].kind != "try":
                 self.emit(Step(None, stmt, line, Status.MANUAL, [f"# TODO: {stmt}"], [CONTROL_NOTE]))
                 return
             self.ensure_body()
@@ -287,20 +298,20 @@ class _Builder:
             ctx.known_vars.update(params)
             self.opener(line, stmt, f"def {m.group(2)}({', '.join(params)}):", True, "function",
                         "Function definition.")
-            self.blocks[-1]["outs"] = outs
+            self.blocks[-1].outs = outs
         elif word == "end":
             if not self.blocks:
                 self.emit(Step(None, stmt, line, Status.MANUAL, [f"# TODO: {stmt}"], [CONTROL_NOTE]))
                 return
             block = self.blocks[-1]
-            if block["kind"] == "switch":
-                if block["in_case"]:
+            if block.kind == "switch":
+                if block.in_case:
                     self.ensure_body()
                 self.blocks.pop()
                 return
-            if block["kind"] == "function" and block.get("outs"):
+            if block.kind == "function" and block.outs:
                 self.emit(Step(None, "(function outputs)", line, Status.EXACT,
-                               [f"return {', '.join(block['outs'])}"], [], structural=True))
+                               [f"return {', '.join(block.outs)}"], [], structural=True))
             self.ensure_body()
             self.blocks.pop()
         elif word in ("return", "break", "continue"):
@@ -311,8 +322,8 @@ class _Builder:
     def finish(self) -> list[Step]:
         while self.blocks:  # unterminated blocks (e.g. a function file without 'end')
             block = self.blocks[-1]
-            if block["kind"] == "switch":
-                if block["in_case"]:
+            if block.kind == "switch":
+                if block.in_case:
                     self.ensure_body()
             else:
                 self.ensure_body()
@@ -320,7 +331,7 @@ class _Builder:
         return self.steps
 
 
-def _mark_superseded(steps: list[Step], set_path: str) -> None:
+def _mark_superseded(steps: list[Step]) -> None:
     """Skip steps that a later reload of the translated .set file makes moot.
 
     EEG.history often ends by reloading the dataset from disk. Everything
@@ -328,9 +339,7 @@ def _mark_superseded(steps: list[Step], set_path: str) -> None:
     away by the reload, so re-running it is redundant (and can fail when it
     points at files on the machine that created the dataset).
     """
-    reloads = [i for i, s in enumerate(steps)
-               if s.call is not None and s.call.func.lower() == "pop_loadset"
-               and s.code and repr(set_path) in s.code[0]]
+    reloads = [i for i, s in enumerate(steps) if s.reloads_dataset]
     if not reloads:
         return
     last = reloads[-1]
@@ -345,27 +354,36 @@ def _mark_superseded(steps: list[Step], set_path: str) -> None:
                              "reflected in the saved file.")
 
 
-def inspect_set(path: str | Path) -> dict:
-    """Read what we need from an EEGLAB ``.set`` file.
+_SET_FIELDS = ("history", "trials", "icaweights")
+_BULKY_FIELDS = ("data", "icaact", "icawinv", "icasphere", "epoch", "event", "urevent",
+                 "chanlocs", "urchanlocs", "times", "etc", "reject", "stats", "specdata",
+                 "specicaact", "dipfit")
 
-    Returns ``{"path", "history", "epoched", "has_ica"}``.
+
+def inspect_set(path: str | Path) -> SetInfo:
+    """Read what we need from an EEGLAB ``.set`` file (not the signals).
+
+    Newer EEGLAB versions store each field as its own MATLAB variable, so only
+    the few fields used here are read. Files that hold one ``EEG`` struct have
+    to be read whole (``.mat`` v5/v7 can't load part of a struct), except that
+    bulky fields are skipped for v7.3 (HDF5) files.
     """
     import numpy as np
     from pymatreader import read_mat
 
-    mat = read_mat(str(path))
+    mat = read_mat(str(path), variable_names=["EEG", *_SET_FIELDS], ignore_fields=_BULKY_FIELDS)
     eeg = mat.get("EEG", mat)
     hist = eeg.get("history", "")
     if isinstance(hist, (list, tuple)):
         hist = "\n".join(str(h) for h in hist)
     trials = eeg.get("trials", 1)
     weights = eeg.get("icaweights")
-    return {
-        "path": str(path),
-        "history": str(hist),
-        "epoched": int(np.atleast_1d(trials)[0]) > 1 if trials is not None else False,
-        "has_ica": weights is not None and np.size(weights) > 0,
-    }
+    return SetInfo(
+        path=str(path),
+        history=str(hist),
+        epoched=int(np.atleast_1d(trials)[0]) > 1 if trials is not None else False,
+        has_ica=weights is not None and np.size(weights) > 0,
+    )
 
 
 def history_from_set(path: str | Path) -> str:

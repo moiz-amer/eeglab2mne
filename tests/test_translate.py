@@ -252,3 +252,17 @@ def test_expressions_in_paths():
     assert step.status is Status.EXACT
     assert ("os.path.join(os.path.join('data', 'raw'), ('%s_task.set' % (subjects[s - 1],)))"
             in step.code[0])
+
+
+def test_unexpected_literal_arguments_are_reported_not_hidden():
+    t = translate("EEG = pop_subcomp(EEG, {'a' 'b'}, 0);")
+    assert t.steps[0].status is Status.MANUAL
+    assert any("unexpected arguments to `pop_subcomp`" in w for w in t.ctx.warnings)
+
+
+@pytest.mark.parametrize("name", ["erp_preprocessing.m", "subject_loop.m"])
+def test_examples_hit_no_unexpected_arguments(name):
+    from pathlib import Path
+    src = (Path(__file__).parent.parent / "examples" / name).read_text()
+    for mode in ("refit", "reuse"):
+        assert not [w for w in translate(src, ica_mode=mode).ctx.warnings if "unexpected" in w]

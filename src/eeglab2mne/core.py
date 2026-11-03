@@ -381,6 +381,27 @@ def history_from_set(path: str | Path) -> str:
 # --------------------------------------------------------------------------
 
 
+_MODULE_USES = {"import numpy as np": re.compile(r"\bnp\."),
+                "import math": re.compile(r"\bmath\."),
+                "import os": re.compile(r"\bos\.")}
+
+
+def _imports_needed(t: Translation) -> set[str]:
+    """Declared imports, plus any module the generated code uses but nobody declared.
+
+    A safety net: a translator that writes ``np.nan`` without registering numpy
+    would otherwise produce a script that dies with NameError.
+    """
+    imports = set(t.ctx.imports)
+    body = "\n".join(ln for s in t.steps for chunk in s.code for ln in chunk.split("\n")
+                     if not ln.lstrip().startswith("#"))
+    body += "\n".join(t.ctx.helpers.values())
+    for imp, used in _MODULE_USES.items():
+        if used.search(body):
+            imports.add(imp)
+    return imports
+
+
 def render_python(t: Translation) -> str:
     c = t.counts
     lines = [
@@ -395,7 +416,7 @@ def render_python(t: Translation) -> str:
         '"""',
         "",
     ]
-    lines += sorted(t.ctx.imports, key=lambda s: (not s.startswith("import"), s))
+    lines += sorted(_imports_needed(t), key=lambda s: (not s.startswith("import"), s))
     lines += ["", ""]
     if t.ctx.uses_todo:
         lines += TODO_HELPER + ["", ""]

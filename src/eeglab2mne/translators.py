@@ -72,7 +72,8 @@ class Context:
     helpers: dict[str, str] = field(default_factory=dict)  # functions emitted once at the top
 
     def env(self) -> ExprEnv:
-        return ExprEnv(known=self.known_vars, obj=self.obj, imports=self.imports)
+        return ExprEnv(known=self.known_vars, obj=self.obj, imports=self.imports,
+                       helpers=self.helpers)
 
 
 class NeedsManual(Exception):

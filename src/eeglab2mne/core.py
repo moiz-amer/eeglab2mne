@@ -11,6 +11,7 @@ from pathlib import Path
 from . import __version__
 from .matlab_expr import ExprError, range_to_python, to_python
 from .parser import Call, parse_script, split_statements
+from .scanner import scan
 from .translators import (CONTROL_FLOW, CONTROL_NOTE, HISTORY_PATH_NOTE, ICA_REUSE_NOTE, REGISTRY,
                           Context, Status, Step, ica_reuse_code, translate_call)
 
@@ -476,10 +477,8 @@ def render_report(t: Translation) -> str:
 
 def _one_line(s: str, limit: int = 110) -> str:
     # Collapse whitespace outside string literals only ('S  1' must survive).
-    out, in_str, prev_space = [], False, False
-    for ch in s:
-        if ch == "'":
-            in_str = not in_str
+    out, prev_space = [], False
+    for _, ch, in_str in scan(s):
         if not in_str and ch.isspace():
             if not prev_space:
                 out.append(" ")

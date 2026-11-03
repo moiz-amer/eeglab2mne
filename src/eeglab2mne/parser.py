@@ -18,6 +18,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .scanner import split_continuation, split_top_level, strip_comment
+
 
 @dataclass(frozen=True)
 class Expr:
@@ -76,42 +78,6 @@ class Call:
 # Statement splitting
 # --------------------------------------------------------------------------
 
-_OPEN = "([{"
-_CLOSE = ")]}"
-
-
-def _is_transpose_quote(text: str, i: int) -> bool:
-    """MATLAB uses ``'`` both for strings and for transpose (``x'``)."""
-    j = i - 1
-    while j >= 0 and text[j] in " \t":
-        j -= 1
-    if j < 0:
-        return False
-    prev = text[j]
-    # Transpose follows an identifier, a number, a closing bracket or another
-    # transpose, *with no whitespace in between*.
-    return j == i - 1 and (prev.isalnum() or prev in "_)]}.'")
-
-
-def strip_comment(line: str) -> str:
-    """Remove a trailing ``%`` comment, respecting string literals."""
-    in_str = False
-    i = 0
-    while i < len(line):
-        ch = line[i]
-        if ch == "'":
-            if in_str:
-                if i + 1 < len(line) and line[i + 1] == "'":
-                    i += 2  # escaped quote inside a string
-                    continue
-                in_str = False
-            elif not _is_transpose_quote(line, i):
-                in_str = True
-        elif ch == "%" and not in_str:
-            return line[:i]
-        i += 1
-    return line
-
 
 def split_statements(text: str) -> list[tuple[int, str]]:
     """Split MATLAB source into ``(line_number, statement)`` pairs.
@@ -136,43 +102,17 @@ def split_statements(text: str) -> list[tuple[int, str]]:
         if in_block_comment:
             continue
 
-        line = strip_comment(raw).rstrip()
+        line, continues = split_continuation(strip_comment(raw))
         if not buf:
             buf_line = lineno
-        if line.endswith("..."):
-            buf += line[:-3] + " "
+        if continues:
+            buf += line + " "
             continue
-        buf += line
+        buf += line.rstrip()
 
-        # Now split buf at top-level ; or , (outside brackets and strings).
-        depth = 0
-        in_str = False
-        start = 0
-        i = 0
-        while i < len(buf):
-            ch = buf[i]
-            if ch == "'":
-                if in_str:
-                    if i + 1 < len(buf) and buf[i + 1] == "'":
-                        i += 2
-                        continue
-                    in_str = False
-                elif not _is_transpose_quote(buf, i):
-                    in_str = True
-            elif not in_str:
-                if ch in _OPEN:
-                    depth += 1
-                elif ch in _CLOSE:
-                    depth -= 1
-                elif ch in ";," and depth == 0:
-                    piece = buf[start:i].strip()
-                    if piece:
-                        statements.append((buf_line, piece))
-                    start = i + 1
-            i += 1
-        piece = buf[start:].strip()
-        if piece:
-            statements.append((buf_line, piece))
+        for piece in split_top_level(buf, ";,"):
+            if piece.strip():
+                statements.append((buf_line, piece.strip()))
         buf = ""
 
     if buf.strip():
@@ -194,36 +134,6 @@ _CALL_RE = re.compile(
 )
 
 
-def _split_top_level(s: str, seps: str) -> list[str]:
-    """Split ``s`` on any char in ``seps`` that sits at bracket depth zero."""
-    parts: list[str] = []
-    depth = 0
-    in_str = False
-    start = 0
-    i = 0
-    while i < len(s):
-        ch = s[i]
-        if ch == "'":
-            if in_str:
-                if i + 1 < len(s) and s[i + 1] == "'":
-                    i += 2
-                    continue
-                in_str = False
-            elif not _is_transpose_quote(s, i):
-                in_str = True
-        elif not in_str:
-            if ch in _OPEN:
-                depth += 1
-            elif ch in _CLOSE:
-                depth -= 1
-            elif ch in seps and depth == 0:
-                parts.append(s[start:i])
-                start = i + 1
-        i += 1
-    parts.append(s[start:])
-    return parts
-
-
 def _split_matrix_row(row: str) -> list[str]:
     """Split a matrix row on commas *or* whitespace (MATLAB allows both).
 
@@ -232,36 +142,8 @@ def _split_matrix_row(row: str) -> list[str]:
     matrices, so we accept the simple rule.
     """
     items: list[str] = []
-    for chunk in _split_top_level(row, ","):
-        # whitespace split, respecting brackets/strings
-        depth = 0
-        in_str = False
-        cur = ""
-        i = 0
-        while i < len(chunk):
-            ch = chunk[i]
-            if ch == "'":
-                if in_str:
-                    if i + 1 < len(chunk) and chunk[i + 1] == "'":
-                        cur += "''"
-                        i += 2
-                        continue
-                    in_str = False
-                elif not _is_transpose_quote(chunk, i):
-                    in_str = True
-            if not in_str and ch in _OPEN:
-                depth += 1
-            if not in_str and ch in _CLOSE:
-                depth -= 1
-            if ch in " \t" and depth == 0 and not in_str:
-                if cur.strip():
-                    items.append(cur.strip())
-                cur = ""
-            else:
-                cur += ch
-            i += 1
-        if cur.strip():
-            items.append(cur.strip())
+    for chunk in split_top_level(row, ","):
+        items += [x.strip() for x in split_top_level(chunk, " \t") if x.strip()]
     return items
 
 
@@ -294,8 +176,8 @@ def parse_value(token: str) -> Any:
         if "'" not in inner.replace("''", ""):
             return inner.replace("''", "'")
     # Double-quoted MATLAB string (R2017a+)
-    if len(t) >= 2 and t[0] == '"' and t[-1] == '"' and '"' not in t[1:-1]:
-        return t[1:-1]
+    if len(t) >= 2 and t[0] == '"' and t[-1] == '"' and '"' not in t[1:-1].replace('""', ''):
+        return t[1:-1].replace('""', '"')
 
     if _NUMBER_RE.match(t):
         v = float(t)
@@ -330,7 +212,7 @@ def parse_value(token: str) -> Any:
         inner = t[1:-1].strip()
         if not inner:
             return []
-        rows = [r for r in _split_top_level(inner, ";\n") if r.strip()]
+        rows = [r for r in split_top_level(inner, ";\n") if r.strip()]
         parsed_rows = [[parse_value(x) for x in _split_matrix_row(r)] for r in rows]
         if len(parsed_rows) == 1:
             row = parsed_rows[0]
@@ -391,7 +273,7 @@ def parse_statement(stmt: str, line: int = 0) -> Call | None:
     raw_args = m.group("args")
     args: list[Any] = []
     if raw_args is not None and raw_args.strip():
-        args = [parse_value(a) for a in _split_top_level(raw_args, ",")]
+        args = [parse_value(a) for a in split_top_level(raw_args, ",")]
     call = Call(
         func=func,
         args=args,

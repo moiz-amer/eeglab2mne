@@ -20,6 +20,8 @@ import ast
 import re
 from dataclasses import dataclass, field
 
+from .scanner import split_top_level
+
 
 class ExprError(Exception):
     """The expression can't be translated safely."""
@@ -460,20 +462,4 @@ def range_to_python(text: str, env: ExprEnv) -> str:
 
 
 def _split_colon(text: str) -> list[str]:
-    parts, depth, buf, quote = [], 0, "", False
-    for i, ch in enumerate(text):
-        if ch == "'" and (quote or not buf.rstrip() or not (buf.rstrip()[-1].isalnum() or
-                                                            buf.rstrip()[-1] in ")]}")):
-            quote = not quote
-        if not quote:
-            if ch in "([{":
-                depth += 1
-            elif ch in ")]}":
-                depth -= 1
-            elif ch == ":" and depth == 0:
-                parts.append(buf)
-                buf = ""
-                continue
-        buf += ch
-    parts.append(buf)
-    return [p.strip() for p in parts]
+    return [p.strip() for p in split_top_level(text, ":")]

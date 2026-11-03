@@ -9,6 +9,7 @@ numerically identical, which are close, and which need a human.
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
@@ -117,6 +118,29 @@ def path_code(ctx: Context, fpath: Any, fname: Any) -> str:
         ctx.imports.add("import os")
         return f"os.path.join({lit(fpath)}, {lit(fname)})"
     return lit((str(fpath).rstrip("/\\") + "/" + str(fname)) if fpath else fname)
+
+
+def leaves_folder(path: str) -> bool:
+    """True if ``path`` is absolute or climbs out of the working folder with ``..``."""
+    p = str(path).replace("\\", "/")
+    return p.startswith("/") or p.startswith("~") or bool(re.match(r"^[A-Za-z]:", p)) or \
+        ".." in p.split("/")
+
+
+def untrusted_paths(ctx: Context) -> bool:
+    """Paths in a .set history were written by whoever made the file, not by the user."""
+    return ctx.set_info is not None
+
+
+# Notes starting with this are repeated as pipeline warnings (for steps that still run).
+HISTORY_PATH_NOTE = "Path from the dataset's history: "
+
+
+def guard_read(ctx: Context, path: str, notes: list[str]) -> None:
+    """Warn about a file the generated code would read outside the working folder."""
+    if untrusted_paths(ctx) and leaves_folder(path):
+        notes.append(f"{HISTORY_PATH_NOTE}reads `{path}`, outside your working folder. "
+                     "Check it before running.")
 
 
 def is_empty(v: Any) -> bool:
@@ -253,6 +277,7 @@ def _loadset(call: Call, ctx: Context) -> Step:
                          "replaced with the file you translated.")
     else:
         full = (fpath.rstrip("/\\") + "/" + fname) if fpath else fname
+        guard_read(ctx, full, notes)
         fname_code = lit(full)
         ctx.input_path, ctx.input_path_code = full, None
 
@@ -279,6 +304,9 @@ def _import(call: Call, ctx: Context) -> Step:
                      [placeholder("INPUT_FILE", "path to the recording", fname),
                       "raw = mne.io.read_raw(INPUT_FILE, preload=True)"],
                      ["The file name is built from MATLAB variables, so set the path by hand."])
+    notes: list[str] = []
+    if isinstance(fname, str):
+        guard_read(ctx, fname, notes)
     code = [f"raw = mne.io.read_raw({lit(fname)}, preload=True)"]
     if call.func.lower() == "pop_loadbv" and len(call.positional) >= 2:
         p, f = call.positional[0], call.positional[1]
@@ -287,7 +315,8 @@ def _import(call: Call, ctx: Context) -> Step:
     ctx.obj = "raw"
     return _step(call, Status.APPROX, code,
                  ["Readers differ in how they map event codes, channel types and units; "
-                  "compare raw.annotations with EEG.event before trusting downstream epoching."])
+                  "compare raw.annotations with EEG.event before trusting downstream epoching."]
+                 + notes)
 
 
 @translates("pop_saveset")
@@ -318,7 +347,14 @@ def _saveset(call: Call, ctx: Context) -> Step:
     out = stem + f"-{suffix}.fif"
     if fpath:
         out = str(fpath).rstrip("/\\") + "/" + out
-    return _step(call, Status.EXACT, [f"{ctx.obj}.save({out!r}, overwrite=True)", export], notes)
+    code = [f"{ctx.obj}.save({out!r}, overwrite=True)", export]
+    if untrusted_paths(ctx) and leaves_folder(out):
+        # A history can name any path; never overwrite files outside the working folder for it.
+        return _step(call, Status.MANUAL, ["# TODO: choose where to save; the history wrote to:"]
+                     + ["# " + c for c in code],
+                     [f"{HISTORY_PATH_NOTE}saves to `{out}`, outside your working folder, so the "
+                      "save is commented out rather than overwriting that file."] + notes)
+    return _step(call, Status.EXACT, code, notes)
 
 
 # ---- channels -------------------------------------------------------------
@@ -360,6 +396,7 @@ def _chanedit(call: Call, ctx: Context) -> Step:
             if not isinstance(path, str):
                 raise NeedsManual("pop_chanedit 'load' with a non-literal file")
             st = Status.APPROX
+            guard_read(ctx, path, notes)
             code.append(f"{o}.set_montage(mne.channels.read_custom_montage({path!r}), on_missing='warn')")
             notes.append(f"Loads electrode positions from `{path.split('/')[-1]}`; update the path "
                          "if the file lives elsewhere on your machine.")

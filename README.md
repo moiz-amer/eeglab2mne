@@ -29,7 +29,8 @@ Nothing is silently dropped: anything the tool can't translate becomes a
 
 ```bash
 pip install "eeglab2mne[run] @ git+https://github.com/moiz-amer/eeglab2mne"
-# [run] adds MNE + mne-icalabel to execute the output (needs Python 3.10–3.14)
+# [run] adds MNE + mne-icalabel to execute the output (needs Python 3.10–3.14);
+# [set] alone is enough to translate .set files without running the result
 
 # translate a script
 eeglab2mne preprocess.m -o preprocess_mne.py --report migration_report.md
@@ -131,7 +132,8 @@ Both translations now reproduce EEGLAB, checked against NumPy ports of
 |---|---|
 | Resampling 500 Hz → 250, 128 and 1000 Hz, and recording lengths that don't divide evenly (e.g. 30504 samples, 128 → 100 Hz) | max relative difference < 10⁻⁹ |
 | Epochs after resampling, with event latencies between samples | identical samples (relative difference < 10⁻⁹) |
-| Epoch length, `[-1 2]` s at 128 Hz | 384 samples, as in EEGLAB's tutorial dataset (MNE's default: 385) || **Same script in real EEGLAB (MATLAB, Signal Processing Toolbox) vs translated MNE code**: load → resample 128 → 100 Hz → 1–30 Hz filter → average reference → epoch → baseline, 80 epochs | correlation 1.000000, max difference < 0.001 µV (before v0.4.1: 0.04) |
+| Epoch length, `[-1 2]` s at 128 Hz | 384 samples, as in EEGLAB's tutorial dataset (MNE's default: 385) |
+| **Same script in real EEGLAB (MATLAB, Signal Processing Toolbox) vs translated MNE code**: load → resample 128 → 100 Hz → 1–30 Hz filter → average reference → epoch → baseline, 80 epochs | correlation 1.000000, max difference < 0.001 µV (before v0.4.1: 0.04) |
 
 ## Loops, conditions and variables
 
@@ -179,6 +181,8 @@ with a clear message instead of guessing. See the full
 - **Filters.** `pop_eegfiltnew` and MNE's `filter()` pick different transition bands by default, which silently changes your data. The translation computes EEGLAB's transition band and filter order and pads data edges the way EEGLAB does, so the filter is identical. `revfilt` becomes a band-stop, `filtorder` is honoured, and filtering restarts at `boundary` events.
 - **Epoching.** `pop_epoch` doesn't baseline-correct, so `baseline=None` (MNE's default would). Epochs have EEGLAB's exact samples and length, and epochs spanning a `boundary` are dropped as EEGLAB does.
 - **Resampling.** EEGLAB's anti-aliasing filter is reproduced instead of MNE's FFT default.
+- **MATLAB arithmetic.** `round` rounds halves away from zero, `^` groups left to right, `num2str(2.0)` is `'2'`, `exist(f, 'file')` returns 2, and ranges with negative or fractional steps include their end value. Small helper functions in the generated code keep these identical to MATLAB.
+- **Untrusted `.set` histories.** Anyone can write a dataset's history, so names it puts into the generated code are checked, saves outside your working folder are commented out, and reads from outside it are listed as warnings.
 - **Translating a `.set` file.** History paths point at the original author's machine, so loads of that dataset are redirected to your file; epoched datasets are read as `mne.Epochs`; steps made moot by a later reload of the same file are marked superseded; and an ICA computed *before* the recorded history is still loaded.
 
 ## Supported EEGLAB functions
@@ -205,7 +209,7 @@ Unknown functions are never dropped; they become `TODO`s.
 ## Development
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/eeglab2mne && cd eeglab2mne
+git clone https://github.com/moiz-amer/eeglab2mne && cd eeglab2mne
 pip install -e ".[test]"
 pytest
 ```

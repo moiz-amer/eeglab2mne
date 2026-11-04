@@ -64,3 +64,40 @@ def test_multi_output_and_transpose():
     items = parse_script("[ALLEEG EEG CURRENTSET] = pop_newset(ALLEEG, EEG, 1, 'gui', 'off');\nx = EEG.data';")
     assert items[0].outputs == ["ALLEEG", "EEG", "CURRENTSET"]
     assert isinstance(items[1], str)  # not a call: left for a human
+
+
+# --- shared scanner: double quotes, escapes, continuations ---------------------
+
+from eeglab2mne.scanner import scan, split_top_level, strip_comment  # noqa: E402
+
+
+def test_percent_inside_double_quotes_is_not_a_comment():
+    assert strip_comment('f = sprintf("sub%02d.set", s); % note') == 'f = sprintf("sub%02d.set", s); '
+    assert split_statements('a = "x;y"; b = 2') == [(1, 'a = "x;y"'), (1, "b = 2")]
+
+
+def test_doubled_quotes_are_escapes():
+    assert strip_comment("x = 'it''s 100%'; % c") == "x = 'it''s 100%'; "
+    assert strip_comment('x = "say ""hi"" 5%"; % c') == 'x = "say ""hi"" 5%"; '
+    assert parse_statement('f("a""b")').args == ['a"b']
+
+
+def test_transpose_is_not_a_string():
+    assert split_top_level("x', 'a,b'", ",") == ["x'", " 'a,b'"]
+    assert [c for _, c, s in scan("a'+'b'") if s] == ["'", "b", "'"]
+
+
+def test_text_after_continuation_is_a_comment():
+    src = "x = 1 + ... add one\n    2;"
+    assert split_statements(src) == [(1, "x = 1 +      2")]
+
+
+def test_double_quoted_sprintf_translates():
+    from eeglab2mne import translate
+    from eeglab2mne.translators import Status
+
+    t = translate('s = 3;\nfname = sprintf("sub%02d.set", s);')
+    assert t.steps[-1].status is Status.EXACT
+    ns = {}
+    exec(t.to_python().replace("import mne\n", ""), ns)
+    assert ns["fname"] == "sub03.set"

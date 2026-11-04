@@ -22,6 +22,11 @@ from .core import inspect_set, translate
 from .translators import Status
 
 
+def _fail(message: str) -> int:
+    print(f"eeglab2mne: {message}", file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="eeglab2mne",
@@ -38,16 +43,30 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     path = Path(args.input)
+    if not path.is_file():
+        return _fail(f"{path}: no such file")
+    for out in (args.output, args.report):
+        if out and Path(out).resolve() == path.resolve():
+            return _fail(f"refusing to overwrite the input file {path} with generated output")
+    if args.output and args.report and Path(args.output).resolve() == Path(args.report).resolve():
+        return _fail("--output and --report point at the same file")
+
     set_info = None
     if path.suffix.lower() == ".set":
-        set_info = inspect_set(path)
+        try:
+            set_info = inspect_set(path)
+        except ImportError as e:
+            return _fail(f"reading .set files needs NumPy and pymatreader ({e.name} is missing). "
+                         'Install them with: pip install "eeglab2mne[run]"')
+        except Exception as e:  # corrupt or non-EEGLAB file
+            return _fail(f"could not read {path.name} as an EEGLAB dataset: {e}")
         text = set_info["history"]
         if not text.strip() and not set_info["has_ica"]:
-            print(f"eeglab2mne: {path.name} has an empty EEG.history; nothing to translate.",
-                  file=sys.stderr)
-            return 1
+            return _fail(f"{path.name} has an empty EEG.history; nothing to translate.")
     else:
         text = path.read_text(encoding="utf-8", errors="replace")
+        if not text.strip():
+            return _fail(f"{path.name} is empty; nothing to translate.")
 
     # A processed .set holds its own ICA, so that is where reuse mode reads it.
     ica_source = str(path) if set_info else None

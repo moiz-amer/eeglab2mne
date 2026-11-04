@@ -9,10 +9,11 @@ numerically identical, which are close, and which need a human.
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, TypedDict
 
 from .matlab_expr import ExprEnv, ExprError, to_python
 from .parser import Call, Expr
@@ -42,10 +43,20 @@ class Step:
     notes: list[str] = field(default_factory=list)
     indent: int = 0  # block depth in the generated Python
     structural: bool = False  # block bookkeeping (end, pass): no report row, no header
+    reloads_dataset: bool = False  # loads the very .set file being translated
 
     @property
     def func(self) -> str:
         return self.call.func if self.call else "(unparsed)"
+
+
+class SetInfo(TypedDict):
+    """Facts about a .set file being translated (see ``core.inspect_set``)."""
+
+    path: str
+    history: str
+    epoched: bool
+    has_ica: bool
 
 
 @dataclass
@@ -60,9 +71,8 @@ class Context:
     warnings: list[str] = field(default_factory=list)
     input_path: str | None = None
     ica_source: str | None = None  # .set file holding EEGLAB's ICA (reuse mode)
-    # Facts read from the .set file being translated (when translating a .set):
-    # {"path": str, "epoched": bool, "has_ica": bool}
-    set_info: dict | None = None
+    # Facts read from the .set file being translated (when translating a .set).
+    set_info: SetInfo | None = None
     # Variables defined earlier in the script (assignments, loop variables).
     known_vars: set[str] = field(default_factory=set)
     # Python code for the loaded file's path when it is built from variables.
@@ -71,7 +81,8 @@ class Context:
     helpers: dict[str, str] = field(default_factory=dict)  # functions emitted once at the top
 
     def env(self) -> ExprEnv:
-        return ExprEnv(known=self.known_vars, obj=self.obj, imports=self.imports)
+        return ExprEnv(known=self.known_vars, obj=self.obj, imports=self.imports,
+                       helpers=self.helpers)
 
 
 class NeedsManual(Exception):
@@ -117,6 +128,29 @@ def path_code(ctx: Context, fpath: Any, fname: Any) -> str:
         ctx.imports.add("import os")
         return f"os.path.join({lit(fpath)}, {lit(fname)})"
     return lit((str(fpath).rstrip("/\\") + "/" + str(fname)) if fpath else fname)
+
+
+def leaves_folder(path: str) -> bool:
+    """True if ``path`` is absolute or climbs out of the working folder with ``..``."""
+    p = str(path).replace("\\", "/")
+    return p.startswith("/") or p.startswith("~") or bool(re.match(r"^[A-Za-z]:", p)) or \
+        ".." in p.split("/")
+
+
+def untrusted_paths(ctx: Context) -> bool:
+    """Paths in a .set history were written by whoever made the file, not by the user."""
+    return ctx.set_info is not None
+
+
+# Notes starting with this are repeated as pipeline warnings (for steps that still run).
+HISTORY_PATH_NOTE = "Path from the dataset's history: "
+
+
+def guard_read(ctx: Context, path: str, notes: list[str]) -> None:
+    """Warn about a file the generated code would read outside the working folder."""
+    if untrusted_paths(ctx) and leaves_folder(path):
+        notes.append(f"{HISTORY_PATH_NOTE}reads `{path}`, outside your working folder. "
+                     "Check it before running.")
 
 
 def is_empty(v: Any) -> bool:
@@ -233,6 +267,7 @@ def _loadset(call: Call, ctx: Context) -> Step:
     epoched = None
     pre: list[str] = []
     status = Status.EXACT
+    reloads = False
     if isinstance(fname, Expr) or isinstance(fpath, Expr):
         pre = [placeholder("INPUT_SET", "path to the .set file",
                            fname if isinstance(fname, Expr) else fpath)]
@@ -248,11 +283,15 @@ def _loadset(call: Call, ctx: Context) -> Step:
         fname_code = lit(info["path"])
         ctx.input_path = info["path"]
         epoched = info["epoched"]
+        reloads = True
         if fpath:
             notes.append(f"Original path `{fpath}` is from the machine that created the file; "
                          "replaced with the file you translated.")
     else:
+        if not isinstance(fname, str) or not isinstance(fpath, str):
+            raise NeedsManual("file name or folder is not text")
         full = (fpath.rstrip("/\\") + "/" + fname) if fpath else fname
+        guard_read(ctx, full, notes)
         fname_code = lit(full)
         ctx.input_path, ctx.input_path_code = full, None
 
@@ -267,7 +306,9 @@ def _loadset(call: Call, ctx: Context) -> Step:
             notes.append("If this .set is already epoched, use mne.read_epochs_eeglab() instead "
                          "and rename `raw` to `epochs`.")
     notes.append("Channel types: EEGLAB marks everything as EEG; set EOG/ECG with set_channel_types().")
-    return _step(call, status, code, notes)
+    step = _step(call, status, code, notes)
+    step.reloads_dataset = reloads
+    return step
 
 
 @translates("pop_biosig", "pop_fileio", "pop_loadbv", "pop_readegi", "pop_loadcnt", "pop_loadeep")
@@ -279,6 +320,9 @@ def _import(call: Call, ctx: Context) -> Step:
                      [placeholder("INPUT_FILE", "path to the recording", fname),
                       "raw = mne.io.read_raw(INPUT_FILE, preload=True)"],
                      ["The file name is built from MATLAB variables, so set the path by hand."])
+    notes: list[str] = []
+    if isinstance(fname, str):
+        guard_read(ctx, fname, notes)
     code = [f"raw = mne.io.read_raw({lit(fname)}, preload=True)"]
     if call.func.lower() == "pop_loadbv" and len(call.positional) >= 2:
         p, f = call.positional[0], call.positional[1]
@@ -287,7 +331,8 @@ def _import(call: Call, ctx: Context) -> Step:
     ctx.obj = "raw"
     return _step(call, Status.APPROX, code,
                  ["Readers differ in how they map event codes, channel types and units; "
-                  "compare raw.annotations with EEG.event before trusting downstream epoching."])
+                  "compare raw.annotations with EEG.event before trusting downstream epoching."]
+                 + notes)
 
 
 @translates("pop_saveset")
@@ -318,7 +363,14 @@ def _saveset(call: Call, ctx: Context) -> Step:
     out = stem + f"-{suffix}.fif"
     if fpath:
         out = str(fpath).rstrip("/\\") + "/" + out
-    return _step(call, Status.EXACT, [f"{ctx.obj}.save({out!r}, overwrite=True)", export], notes)
+    code = [f"{ctx.obj}.save({out!r}, overwrite=True)", export]
+    if untrusted_paths(ctx) and leaves_folder(out):
+        # A history can name any path; never overwrite files outside the working folder for it.
+        return _step(call, Status.MANUAL, ["# TODO: choose where to save; the history wrote to:"]
+                     + ["# " + c for c in code],
+                     [f"{HISTORY_PATH_NOTE}saves to `{out}`, outside your working folder, so the "
+                      "save is commented out rather than overwriting that file."] + notes)
+    return _step(call, Status.EXACT, code, notes)
 
 
 # ---- channels -------------------------------------------------------------
@@ -360,6 +412,7 @@ def _chanedit(call: Call, ctx: Context) -> Step:
             if not isinstance(path, str):
                 raise NeedsManual("pop_chanedit 'load' with a non-literal file")
             st = Status.APPROX
+            guard_read(ctx, path, notes)
             code.append(f"{o}.set_montage(mne.channels.read_custom_montage({path!r}), on_missing='warn')")
             notes.append(f"Loads electrode positions from `{path.split('/')[-1]}`; update the path "
                          "if the file lives elsewhere on your machine.")
@@ -952,10 +1005,23 @@ def translate_call(call: Call, ctx: Context) -> Step:
         return fn(call, ctx)
     except NeedsManual as e:
         return _step(call, Status.MANUAL, [f"# TODO: {call.source}"], [str(e)])
-    except (TypeError, ValueError, AttributeError):
-        # A variable reached a step that needs a literal value (e.g. arithmetic on it).
+    except (TypeError, ValueError, AttributeError) as e:
+        if _has_pyexpr(call.positional + [v for _, v in call.pairs]):
+            # A variable reached a step that needs a literal value (e.g. arithmetic on it).
+            return _step(call, Status.MANUAL, [f"# TODO: {call.source}"],
+                         ["An argument comes from a variable this step can't use yet; "
+                          "translate by hand."])
+        # Literal arguments of a shape this translator doesn't expect (often
+        # invalid MATLAB). Say so plainly rather than passing it off as routine.
+        ctx.warnings.append(f"Line {call.line}: unexpected arguments to `{call.func}` "
+                            f"({type(e).__name__}: {e}). Check this call in the original script.")
         return _step(call, Status.MANUAL, [f"# TODO: {call.source}"],
-                     ["An argument comes from a variable this step can't use yet; translate by hand."])
+                     [f"Unexpected arguments for `{call.func}` ({type(e).__name__}: {e}); "
+                      "translate by hand."])
+
+
+def _has_pyexpr(values: list[Any]) -> bool:
+    return any(isinstance(v, PyExpr) or (isinstance(v, list) and _has_pyexpr(v)) for v in values)
 
 
 _DATASET_NAMES = {"EEG", "ALLEEG", "EEGOUT", "OUTEEG", "CURRENTSET", "ALLCOM", "LASTCOM"}

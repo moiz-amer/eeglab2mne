@@ -6,6 +6,7 @@ computed in EEGLAB, so it checks the translation against the real thing rather
 than against data we made up.
 """
 
+import hashlib
 import runpy
 import urllib.request
 
@@ -15,7 +16,12 @@ import pytest
 from eeglab2mne.cli import main
 
 BASE = "https://raw.githubusercontent.com/sccn/eeglab/develop/sample_data/"
-FILES = ("eeglab_data_epochs_ica.set", "eeglab_data_epochs_ica.fdt")
+# The files come from a moving branch, so pin their contents: if upstream ever
+# changes them, the test fails loudly instead of silently validating new data.
+FILES = {
+    "eeglab_data_epochs_ica.set": "8aa47f3d4e6fb6aa3fa3120806e6017e7b652e92d62221fa7115a75e3ed8a699",
+    "eeglab_data_epochs_ica.fdt": "466cbea87b0fb2298db291011902000848e10ec265ed982dd54a8fa768d5e11f",
+}
 
 pytest.importorskip("mne")
 
@@ -28,7 +34,10 @@ def tutorial_set(tmp_path_factory):
             urllib.request.urlretrieve(BASE + name, folder / name)
     except Exception as exc:  # pragma: no cover - network dependent
         pytest.skip(f"could not download EEGLAB sample data: {exc}")
-    return folder / FILES[0]
+    for name, expected in FILES.items():
+        digest = hashlib.sha256((folder / name).read_bytes()).hexdigest()
+        assert digest == expected, f"EEGLAB's {name} changed upstream (sha256 {digest})"
+    return folder / next(iter(FILES))
 
 
 def test_history_translation_runs_on_eeglab_tutorial(tutorial_set, tmp_path):

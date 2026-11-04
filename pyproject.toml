@@ -16,18 +16,20 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Medical Science Apps.",
 ]
-# The translator itself is pure Python. MNE is only needed to *run* the output.
+# The translator itself is pure Python. Reading .set files needs NumPy and
+# pymatreader ([set]); running the generated code needs MNE ([run]).
 dependencies = []
 
 [project.optional-dependencies]
-run = ["mne>=1.6", "pymatreader", "mne-icalabel", "onnxruntime"]
+set = ["numpy", "pymatreader"]
+run = ["numpy", "pymatreader", "mne>=1.6", "mne-icalabel", "onnxruntime"]
 test = ["pytest", "mne>=1.6", "pymatreader", "eeglabio", "mne-icalabel", "onnxruntime", "scipy"]
 
 [project.scripts]
 eeglab2mne = "eeglab2mne.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/YOUR-USERNAME/eeglab2mne"
+Homepage = "https://github.com/moiz-amer/eeglab2mne"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/eeglab2mne"]

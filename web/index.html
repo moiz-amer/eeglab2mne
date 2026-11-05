@@ -112,6 +112,7 @@
         <option value="examples/erp_preprocessing.m">ERP preprocessing</option>
         <option value="examples/subject_loop.m">Loop over subjects</option>
         <option value="">(blank)</option>
+        <option value="custom" hidden>(your script)</option>
       </select>
       <label for="ica">ICA</label>
       <select id="ica" title="refit: fit a new ICA in MNE. reuse: load EEGLAB's decomposition from the .set">
@@ -187,6 +188,7 @@ async function loadPython() {
 
 async function loadExample() {
   const path = $("example").value;
+  if (path === "custom") return;
   if (!path) { $("src").value = ""; return; }
   try {
     $("src").value = await (await fetch(path)).text();
@@ -246,6 +248,8 @@ for (const tab of document.querySelectorAll(".tab")) {
 }
 $("example").addEventListener("change", async () => { await loadExample(); translateNow(); });
 $("ica").addEventListener("change", translateNow);
+// Once the text is edited it is no longer the selected example.
+$("src").addEventListener("input", () => { $("example").value = "custom"; });
 $("go").addEventListener("click", translateNow);
 $("src").addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); translateNow(); }

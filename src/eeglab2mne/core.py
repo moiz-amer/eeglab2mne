@@ -106,6 +106,21 @@ def _is_ident(name: str) -> bool:
     return bool(_IDENT_RE.fullmatch(name)) and not keyword.iskeyword(name)
 
 
+# Why a helper appears in the generated code, shown next to the step that uses it.
+_HELPER_NOTES = {
+    "matlab_round": "Uses matlab_round(): MATLAB rounds halves away from zero (round(2.5) is 3), "
+                    "but Python's round() rounds to even (2).",
+    "matlab_num2str": "Uses matlab_num2str(): matches MATLAB's num2str (num2str(2.0) is '2', "
+                      "not Python's '2.0').",
+    "matlab_colon": "Uses matlab_colon(): MATLAB's start:step:stop with a non-integer or "
+                    "variable step, which Python's range() can't express.",
+}
+
+
+def _helper_notes(code: str) -> list[str]:
+    return [note for name, note in _HELPER_NOTES.items() if f"{name}(" in code]
+
+
 _FUNC_RE = re.compile(r"^function\s+(?:(\[[^\]]*\]|[A-Za-z_]\w*)\s*=\s*)?([A-Za-z_]\w*)\s*(?:\(([^)]*)\))?$")
 
 
@@ -157,9 +172,11 @@ class _Builder:
             return self.todo(text.strip()), False
 
     def opener(self, line: int, src: str, code: str, ok: bool, kind: str, note: str) -> None:
-        self.emit(Step(None, src, line, Status.EXACT if ok else Status.MANUAL, [code],
-                       [note] if ok else [note, "Could not translate this part automatically; "
-                                                "the script stops here with a TODO error until you do."]))
+        notes = [note] + _helper_notes(code)
+        if not ok:
+            notes.append("Could not translate this part automatically; "
+                         "the script stops here with a TODO error until you do.")
+        self.emit(Step(None, src, line, Status.EXACT if ok else Status.MANUAL, [code], notes))
         self.blocks.append(_Block(kind))
 
     # -- statements ----------------------------------------------------------
@@ -202,7 +219,7 @@ class _Builder:
             return
         self.ctx.known_vars.add(name)
         self.emit(Step(None, stmt, line, Status.EXACT, [f"{name} = {code}"],
-                       ["Variable assignment."]))
+                       ["Variable assignment."] + _helper_notes(code)))
 
     def control(self, line: int, stmt: str, word: str, rest: str) -> None:
         ctx = self.ctx

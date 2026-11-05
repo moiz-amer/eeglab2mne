@@ -3,6 +3,8 @@
 
 **Translate EEGLAB pipelines into MNE-Python, and know exactly which steps you can trust.**
 
+**[▶ Try it in your browser](https://moiz-amer.github.io/eeglab2mne/)**: paste a script, get Python and the report. Nothing is uploaded.
+
 Many EEG labs are moving from MATLAB/EEGLAB to Python/MNE, but years of
 preprocessing live in EEGLAB scripts and in the processing history stored
 inside `.set` files. Rewriting them by hand is slow, and the dangerous part is

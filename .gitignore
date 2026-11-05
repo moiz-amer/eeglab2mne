@@ -9,3 +9,4 @@ dist/
 *.set
 *.fdt
 !examples/*.set
+_site/

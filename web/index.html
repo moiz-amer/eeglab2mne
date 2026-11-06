@@ -175,10 +175,12 @@ function setStatus(msg, isError) {
 
 async function loadPython() {
   const pyodide = await loadPyodide();
-  const manifest = await (await fetch("py/manifest.json")).json();
+  // The manifest is always revalidated; the Python files are fetched with the
+  // build's content hash so a browser never mixes files from two deploys.
+  const manifest = await (await fetch("py/manifest.json", { cache: "no-cache" })).json();
   pyodide.FS.mkdirTree("/home/pyodide/pkg/eeglab2mne");
   await Promise.all(manifest.files.map(async (f) => {
-    const text = await (await fetch("py/" + f)).text();
+    const text = await (await fetch(`py/${f}?v=${manifest.version}`)).text();
     pyodide.FS.writeFile("/home/pyodide/pkg/" + f, text);
   }));
   pyodide.runPython("import sys; sys.path.insert(0, '/home/pyodide/pkg'); import demo_api");
@@ -191,7 +193,7 @@ async function loadExample() {
   if (path === "custom") return;
   if (!path) { $("src").value = ""; return; }
   try {
-    $("src").value = await (await fetch(path)).text();
+    $("src").value = await (await fetch(path, { cache: "no-cache" })).text();
   } catch (e) {
     $("src").value = "% Could not load the example: " + e;
   }

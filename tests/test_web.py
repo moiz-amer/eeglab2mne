@@ -54,3 +54,10 @@ def test_build_ships_every_package_module(tmp_path):
     for example in build.EXAMPLES:
         assert f'value="examples/{example}"' in html
         assert (tmp_path / "site" / "examples" / example).is_file()
+
+
+def test_warnings_point_to_the_ica_menu_not_the_cli_flag():
+    src = (ROOT / "examples" / "erp_preprocessing.m").read_text()
+    warnings = run(src)["warnings"]
+    assert any("set ICA to “reuse EEGLAB's”" in w for w in warnings)
+    assert not any("--ica" in w for w in warnings)

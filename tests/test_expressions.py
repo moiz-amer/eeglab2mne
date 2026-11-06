@@ -106,3 +106,12 @@ def test_helpers_are_valid_python():
     for src in (MATLAB_ROUND, MATLAB_NUM2STR, MATLAB_COLON):
         compile(src, "<helper>", "exec")
     assert math  # imported for the helpers' namespace in run()
+
+
+def test_steps_explain_the_matlab_helpers_they_use():
+    t = translate("n = round(2.5);\nlabel = num2str(2.0);\nfor k = 0:0.5:2\n x = k;\nend")
+    notes = {s.source: " ".join(s.notes) for s in t.steps}
+    assert "rounds halves away from zero" in notes["n = round(2.5)"]
+    assert "num2str(2.0) is '2'" in notes["label = num2str(2.0)"]
+    assert "matlab_colon()" in notes["for k = 0:0.5:2"]
+    assert "matlab_" not in notes["x = k"]

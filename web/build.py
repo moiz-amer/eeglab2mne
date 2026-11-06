@@ -8,6 +8,7 @@ the same code as the released tool. Usage::
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sys
@@ -34,7 +35,13 @@ def build(out: Path) -> list[str]:
     for name in EXAMPLES:
         shutil.copy(ROOT / "examples" / name, out / "examples" / name)
 
-    (out / "py" / "manifest.json").write_text(json.dumps({"files": files}, indent=1))
+    # A hash of the shipped code: the page appends it to every file URL, so a new
+    # deploy is never served from a browser's cache of the previous one.
+    digest = hashlib.sha256()
+    for f in files:
+        digest.update(f.encode() + b"\0" + (out / "py" / f).read_bytes())
+    manifest = {"version": digest.hexdigest()[:12], "files": files}
+    (out / "py" / "manifest.json").write_text(json.dumps(manifest, indent=1))
     (out / ".nojekyll").write_text("")  # serve files as-is on GitHub Pages
     return files
 

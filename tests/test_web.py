@@ -61,3 +61,20 @@ def test_warnings_point_to_the_ica_menu_not_the_cli_flag():
     warnings = run(src)["warnings"]
     assert any("set ICA to “reuse EEGLAB's”" in w for w in warnings)
     assert not any("--ica" in w for w in warnings)
+
+
+def test_manifest_version_changes_with_the_code(tmp_path, monkeypatch):
+    build.build(tmp_path / "a")
+    first = json.loads((tmp_path / "a" / "py" / "manifest.json").read_text())["version"]
+    build.build(tmp_path / "b")
+    assert json.loads((tmp_path / "b" / "py" / "manifest.json").read_text())["version"] == first
+
+    changed = tmp_path / "web"
+    changed.mkdir()
+    for name in ("index.html", "demo_api.py"):
+        (changed / name).write_text((build.WEB / name).read_text())
+    (changed / "demo_api.py").write_text((changed / "demo_api.py").read_text() + "\n# edit\n")
+    monkeypatch.setattr(build, "WEB", changed)
+    build.build(tmp_path / "c")
+    assert json.loads((tmp_path / "c" / "py" / "manifest.json").read_text())["version"] != first
+    assert "?v=${manifest.version}" in (tmp_path / "c" / "index.html").read_text()

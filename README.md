@@ -82,7 +82,7 @@ ica.fit(raw)
 ic_proba = iclabel_label_components(raw, ica, inplace=True)  # (n_ics, 7)
 ...
 epochs.apply_baseline((-0.2, 0.0))          # EEGLAB ms -> MNE s
-data = epochs.get_data(picks=epochs.ch_names[0:30], tmin=-0.2, tmax=0.796) * 1e6  # V -> µV
+data = epochs.get_data(picks=epochs.ch_names[0:30], units=dict(eeg='uV', ...), tmin=-0.2, tmax=0.796)
 bad = np.any((data < -100) | (data > 100), axis=(1, 2))   # absolute, not peak-to-peak
 ```
 

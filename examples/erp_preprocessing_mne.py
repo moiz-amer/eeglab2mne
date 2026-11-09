@@ -152,7 +152,7 @@ if _bnd:
 epochs.apply_baseline((-0.2, 0.0))
 
 # --- L31: EEG = pop_eegthresh(EEG, 1, 1:30, -100, 100, -0.2, 0.796, 0, 1)  [exact]
-data = epochs.get_data(picks=epochs.ch_names[0:30], tmin=-0.2, tmax=0.796) * 1e6  # V -> µV, EEGLAB thresholds are µV
+data = epochs.get_data(picks=epochs.ch_names[0:30], units=dict(eeg='uV', eog='uV', ecg='uV', emg='uV', bio='uV'), tmin=-0.2, tmax=0.796)
 bad = np.any((data < -100) | (data > 100), axis=(1, 2))
 epochs.drop(np.flatnonzero(bad), reason='eeglab_threshold')
 

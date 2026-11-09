@@ -30,9 +30,10 @@ Nothing is silently dropped: anything the tool can't translate becomes a
 ## Quick start
 
 ```bash
-pip install "eeglab2mne[run] @ git+https://github.com/moiz-amer/eeglab2mne"
+pip install "eeglab2mne[run]"
 # [run] adds MNE + mne-icalabel to execute the output (needs Python 3.10–3.14);
-# [set] alone is enough to translate .set files without running the result
+# eeglab2mne[set] is enough to translate .set files without running the result,
+# and plain `pip install eeglab2mne` translates scripts with no dependencies
 
 # translate a script
 eeglab2mne preprocess.m -o preprocess_mne.py --report migration_report.md
@@ -86,8 +87,8 @@ data = epochs.get_data(picks=epochs.ch_names[0:30], units=dict(eeg='uV', ...), t
 bad = np.any((data < -100) | (data > 100), axis=(1, 2))   # absolute, not peak-to-peak
 ```
 
-See the full [generated script](examples/erp_preprocessing_mne.py) and
-[migration report](examples/erp_preprocessing_report.md).
+See the full [generated script](https://github.com/moiz-amer/eeglab2mne/blob/main/examples/erp_preprocessing_mne.py) and
+[migration report](https://github.com/moiz-amer/eeglab2mne/blob/main/examples/erp_preprocessing_report.md).
 
 ## Validated on EEGLAB's own data
 
@@ -170,7 +171,7 @@ string concatenation, `fullfile`, `sprintf`, `num2str`, `strcmp`, `length` and
 `EEG.srate`/`EEG.nbchan`/`EEG.pnts`. A variable is only used if the script
 defines it; anything else becomes `TODO(...)`, which stops the generated script
 with a clear message instead of guessing. See the full
-[loop example](examples/subject_loop.m) → [generated Python](examples/subject_loop_mne.py).
+[loop example](https://github.com/moiz-amer/eeglab2mne/blob/main/examples/subject_loop.m) → [generated Python](https://github.com/moiz-amer/eeglab2mne/blob/main/examples/subject_loop_mne.py).
 
 ## Pitfalls it handles
 

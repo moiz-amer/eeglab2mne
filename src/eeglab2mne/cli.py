@@ -57,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
             set_info = inspect_set(path)
         except ImportError as e:
             return _fail(f"reading .set files needs NumPy and pymatreader ({e.name} is missing). "
-                         'Install them with: pip install "eeglab2mne[run]"')
+                         'Install them with: pip install "eeglab2mne[set]"')
         except Exception as e:  # corrupt or non-EEGLAB file
             return _fail(f"could not read {path.name} as an EEGLAB dataset: {e}")
         text = set_info["history"]

@@ -72,7 +72,27 @@ def test_epoching_switches_object_and_skips_baseline():
 def test_threshold_uses_microvolts_not_peak_to_peak():
     t = translate("EEG = pop_epoch(EEG, {}, [-1 2]);\nEEG = pop_eegthresh(EEG, 1, [1:3], -75, 75, -1, 1.996, 0, 1);")
     code = "\n".join(t.steps[1].code)
-    assert "* 1e6" in code and "reject=" not in code
+    assert "units=dict(eeg='uV', eog='uV'" in code and "reject=" not in code
+
+
+def test_threshold_handles_eeg_and_eog_in_one_range():
+    """EEGLAB channel ranges often include EOG; units='uV' alone would raise in MNE."""
+    pytest.importorskip("mne")
+    import mne
+    import numpy as np
+
+    mne.set_log_level("ERROR")
+    rng = np.random.default_rng(1)
+    info = mne.create_info(["Fz", "Cz", "Pz", "HEOG"], 250.0, ["eeg", "eeg", "eeg", "eog"])
+    data = rng.normal(0, 20e-6, (6, 4, 250))
+    data[2, 3, 100] = 300e-6   # only the EOG channel crosses the threshold in epoch 2
+    data[4, 0, 50] = -150e-6   # an EEG channel crosses it in epoch 4
+    epochs = mne.EpochsArray(data, info, tmin=-0.2)
+    t = translate("EEG = pop_epoch(EEG, {}, [-0.2 0.8]);\n"
+                  "EEG = pop_eegthresh(EEG, 1, 1:4, -100, 100, -0.2, 0.796, 0, 1);")
+    ns = {"np": np, "epochs": epochs}
+    exec("\n".join(t.steps[1].code), ns)
+    assert list(ns["epochs"].selection) == [0, 1, 3, 5]
 
 
 def test_subcomp_after_refit_is_manual():

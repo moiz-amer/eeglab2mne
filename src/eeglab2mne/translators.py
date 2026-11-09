@@ -728,6 +728,9 @@ def _clean_rawdata(call: Call, ctx: Context) -> Step:
                   "was largely attributed to clean_rawdata's bad-channel step, so do not drop it silently."])
 
 
+_MICROVOLTS = "dict(eeg='uV', eog='uV', ecg='uV', emg='uV', bio='uV')"
+
+
 @translates("pop_eegthresh")
 def _eegthresh(call: Call, ctx: Context) -> Step:
     # pop_eegthresh(EEG, typerej, elec, lowthresh, upthresh, starttime, endtime, superpose, reject)
@@ -741,13 +744,17 @@ def _eegthresh(call: Call, ctx: Context) -> Step:
     tmin = "" if is_empty(t0) else f", tmin={lit(t0)}"
     tmax = "" if is_empty(t1) else f", tmax={lit(t1)}"
     ctx.imports.add("import numpy as np")
-    code = [f"data = epochs.get_data(picks={picks}{tmin}{tmax}) * 1e6  # V -> µV, EEGLAB thresholds are µV",
+    # EEGLAB thresholds are in µV. A dict (not units='uV') so that ranges mixing EEG
+    # with EOG/ECG channels work; MNE refuses a single string for mixed types.
+    code = [f"data = epochs.get_data(picks={picks}, units={_MICROVOLTS}{tmin}{tmax})",
             f"bad = np.any((data < {lit(lo)}) | (data > {lit(hi)}), axis=(1, 2))",
             "epochs.drop(np.flatnonzero(bad), reason='eeglab_threshold')"]
     return _step(call, Status.EXACT, code,
                  ["Absolute-amplitude rejection. Do NOT translate this to MNE's reject=dict(eeg=...): "
                   "that is a peak-to-peak criterion and rejects different epochs.",
-                  "Units: MNE stores Volts, EEGLAB µV."])
+                  "Units: MNE stores Volts and EEGLAB µV; get_data(units=...) converts. Channels "
+                  "of type 'misc' have no voltage unit in MNE and are compared unscaled, so leave "
+                  "them out of the channel range."])
 
 
 @translates("pop_rejepoch")
